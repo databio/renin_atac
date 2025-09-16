@@ -1,0 +1,330 @@
+---
+title: "4. GO Enrichment Analysis with rGREAT"
+author: "xue"
+date: "2024-02-27"
+output: html_document
+---
+
+This document 1) performs the GO enrichment analysis on differentially accessible regions in renin-expressing samples, 2) calculates the weighted rank of renin vs non-renin related regions on renin related GO terms, and 3) generate some diagnostic plots.
+
+# 4a. Setup environment
+
+## Load packages
+
+```{r}
+library(rGREAT)
+library(ggplot2)
+library(data.table)
+library(dplyr)
+library(genomation)
+```
+
+## Set working directory
+
+```{r}
+wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/gitk_univ"
+knitr::opts_knit$set(root.dir = wd)
+```
+
+## Define file paths
+
+### Set input path
+
+```{r}
+bed_dir = "bed"
+
+bed_paths = list(
+  all_up = file.path(bed_dir, "deseq_all_diff_up.bed"),        # all inc accessibility region
+  all_down = file.path(bed_dir, "deseq_all_diff_down.bed"),    # all inc accessibility region
+  non_differential = file.path(bed_dir, "deseq_non_diff.bed"),          # all non-differential region
+  renin = file.path(bed_dir, "renin_specific_regions.bed") # renin specific regions
+)
+```
+
+### Set output path
+
+```{r}
+output_plot = file.path("plot", "GO_enrichment")
+# dir.create(output_plot, showWarnings = FALSE)
+```
+
+## Load input files
+
+```{r}
+# Load input BED files
+region_set = GRangesList(lapply(bed_paths[1:3], function(f) readGeneric(f)))
+ 
+# Background for enrichment
+# (ex. any enrichment specific to WT in reference to all renin-expressing samples)
+bg = c(region_set$all_up, region_set$all_down, region_set$non_differential)
+
+# set up grangelist for core renin specific vs other increasing accessibility regions
+renin_specific = readGeneric(bed_paths$renin)
+other_regions = subsetByOverlaps(region_set$all_up, renin_specific, invert = TRUE)
+
+query = GRangesList(renin_specific, other_regions)
+names(query) = c("renin_specific", "other")
+```
+
+# 4b. Run GO enrichment analysis
+
+```{r}
+# define Functions
+
+getBioEnrichment = function(gr, use_bg="FALSE", bg) {
+  job = if (use_bg) submitGreatJob(gr, bg, species = "mm10") else submitGreatJob(gr, species = "mm10")
+  tb = getEnrichmentTables(job)
+  return(tb$`GO Biological Process`)
+}
+
+```
+
+## GO enrichment in increasing, decreasing, and non-differential region sets
+
+```{r}
+# run go enrichment analysis
+differential_enrichment_results = lapply(names(region_set), function(set) {
+  getBioEnrichment(region_set[[set]], use_bg = TRUE, bg = bg)
+})
+# name the result list
+names(differential_enrichment_results) = names(region_set)
+```
+
+## GO enrichment in core renin-specific and other increasing accessibiloty regions
+
+```{r}
+# run go enrichment analysis
+renin_enrichment_results = lapply(names(query), function(set) {
+  getBioEnrichment(query[[set]], use_bg = TRUE, bg=bg)
+})
+# name the result list
+names(renin_enrichment_results) = names(query)
+
+```
+
+# 4c. Plot GO enrichment results of differentially accessible regions
+
+```{r}
+# define function
+plotTopEnrichedGO = function(dfs, n = 20, output) {
+  dir.create(output, showWarnings = FALSE, recursive = TRUE)
+
+  lapply(names(dfs), function(name) {
+    df = dfs[[name]]
+    
+    # Filter and rank
+    go_bio = subset(df, Hyper_Fold_Enrichment >= 2)
+    plot_this = head(go_bio[order(go_bio$Hyper_Adjp_BH), ], n)
+    
+    if (nrow(plot_this) == 0) {
+      message(sprintf("Skipping %s: no terms with Fold Enrichment >= 2", name))
+      return(NULL)
+    }
+
+    # Shorten overly long term names (optional)
+    plot_this$name <- sapply(plot_this$name, function(s) {
+      if (nchar(s) > 60) paste0(substr(s, 1, 57), "...") else s
+    })
+
+    # Prepare data for plotting
+    x = factor(plot_this$name, levels = rev(plot_this$name))  # reverse for top-down
+    y = -log10(plot_this$Hyper_Adjp_BH)
+    data = data.frame(x, y)
+
+    # Estimate width: 0.25 per bar + padding
+    plot_width = max(6, 0.25 * n + 2)
+
+    # Build plot
+    p = ggplot(data, aes(x = x, y = y)) +
+      geom_bar(stat = "identity", fill = "lightgrey", width = 0.8) +
+      coord_flip() +
+      labs(title = name, y = "-log10(FDR)", x = "") +
+      theme_bw() +
+      theme(
+        aspect.ratio = 1,
+        axis.text.y = element_text(size = 8, colour = "black"),
+        axis.text.x = element_text(size = 10, colour = "black"),
+        axis.line = element_line(colour = "black"),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        plot.title = element_text(hjust = 1)
+      )
+
+    # Save plot
+    file_name = file.path(output, paste0("top_enriched_go_", name, ".svg"))
+    ggsave(file_name, plot = p, width = plot_width, height = 6)
+    message("Saved: ", file_name)
+
+    return(p)
+  })
+}
+```
+
+```{r}
+plotTopEnrichedGO(differential_enrichment_results, n = 20, output = outputplot)
+```
+
+# 4d. Calculate weighted rank of the renin related GO terms for Renin vs other regions
+
+```{r}
+# define function
+
+filterEnrichment = function(df) {
+  go = subset(df, df$Hyper_Raw_PValue <= 0.001)
+  rownames(go) = seq_len(nrow(go))
+  return(go)
+}
+
+getTopGOTerms = function(dfs, n = 50) {
+  # get the top enriched go terms in each region set by fold enrichment 
+  top_fold = unlist(lapply(dfs, function(x) {
+    x = x[order(-x$Hyper_Fold_Enrichment), ]
+    head(na.omit(x$name), n)
+  }))
+  # get the top enriched go terms in each region set by p-value
+  top_pval = unlist(lapply(dfs, function(x) {
+    x = x[order(x$Hyper_Adjp_BH), ]
+    head(na.omit(x$name), n)
+  }))
+
+  unique(c(
+    top_fold,
+    top_pval
+    ))
+}
+
+getReninGOTerms = function(dfs, n = 50) {
+  # get renin related go terms
+  keywords = c(
+    "notch", "cAMP", 
+    "angiotensin", "aldosterone", "renin", 
+    "vasculogenesis", "blood vessel", 
+    "arteriole", "blood pressure",
+    "smooth muscle cell",
+    "cell fate", 
+    "kidney", "renal", "nephron"
+  )
+
+  # Create a single regex pattern
+  pattern = paste(keywords, collapse = "|")
+
+  # Extract matching GO terms from all input tables
+  matched_terms = unlist(lapply(dfs, function(df) {
+    df$name[grepl(pattern, df$name, ignore.case = TRUE)]
+  }))
+
+  # Return unique terms
+  unique(matched_terms)
+}
+
+getRank = function(df, group) {
+  df = df[order(df$Hyper_Adjp_BH), ]
+  df$rank_pvalue = seq_len(nrow(df))
+  df = df[order(df$Hyper_Fold_Enrichment), ]
+  df$rank_fold = seq_len(nrow(df))
+  df$Rank = rowMeans(df[, c('rank_pvalue', 'rank_fold')])
+  df$Group = group
+  return(df)
+}
+
+getRankWeight = function(dfs, my_go_terms) {
+  total = max(sapply(dfs, nrow))
+
+  # First: compute rank_pvalue_weight and filter
+  for (i in seq_along(dfs)) {
+    dfs[[i]]$rank_pvalue_weight = (total - dfs[[i]]$rank_pvalue)/total
+    dfs[[i]] = subset(dfs[[i]], name %in% my_go_terms)
+  }
+
+  # Then: calculate sum of rank_pvalue_weight for each term across all dfs
+  for (t in my_go_terms) {
+  # Sum the weights across all dfs for this term
+  term_sum = sum(sapply(dfs, function(df) {
+    w = df$rank_pvalue_weight[df$name == t]
+    if (length(w) == 0) return(0)
+    return(w)
+  }))
+  # Assign normalized weights back to each df
+  for (i in seq_along(dfs)) {
+    idx = dfs[[i]]$name == t
+    if (any(idx)) {
+      dfs[[i]]$rank_weight[idx] = dfs[[i]]$rank_pvalue_weight[idx] / term_sum
+    }
+  }
+}
+  return(dfs)
+}
+
+
+```
+
+```{r}
+# filter results
+go_results = lapply(renin_enrichment_results, filterEnrichment)
+
+# get list of GO terms
+my_go_terms = getReninGOTerms(go_results)
+```
+
+# 4e. Plot weighted rank of the renin related GO terms: core renin specific region vs other increasing accessibility regions
+
+```{r}
+rank_dfs = lapply(names(go_results), function(set) {
+  getRank(go_results[[set]], group = set)
+})
+
+names(rank_dfs) = names(go_results)
+
+rank_dfs = getRankWeight(rank_dfs, my_go_terms)
+
+plot_this = do.call(rbind, rank_dfs)
+plot_this = plot_this[!is.na(plot_this$name), ]
+rownames(plot_this) = NULL
+
+data = plot_this %>%
+  select(name, Group, Rank_weight = rank_weight, Pval_rank = rank_pvalue,
+         Pval_rank_weight = rank_pvalue_weight)
+
+data$Group = factor(data$Group, levels = c("renin_specific", "other"))
+
+order = data %>%
+  filter(Group == "renin_specific") %>%
+  arrange(desc(Rank_weight)) %>%
+  mutate(labels = factor(name)) %>%
+  head(50)
+
+data_new = filter(data, name %in% order$name)
+new_order = data_new %>%
+  filter(Group == "renin_specific") %>%
+  arrange(desc(Rank_weight)) %>%
+  mutate(labels = factor(name))
+```
+
+```{r}
+# plot
+output_file <- file.path(output_plot, "rank_weight_stacked_bar.svg")
+n_terms <- length(unique(data_new$name))
+plot_width <- max(6, 0.25 * n_terms + 2)
+
+# Build and save the plot
+p <- data_new %>%
+  mutate(labels = factor(name, levels = new_order$labels)) %>%
+  ggplot(aes(fill = Group, y = Rank_weight, x = labels)) + 
+  geom_bar(position = "fill", stat = "identity", width = 0.9) +
+  scale_fill_manual(values = c("renin_specific" = "#e1812c", "others" = "lightgrey")) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 6, color = "black"),
+    axis.text.y = element_text(size = 6, color = "black"),
+    axis.title = element_text(size = 8, color = "black"),
+    panel.grid = element_blank(),
+  ) +
+  labs(y = "Enrichment Weight", x = "GO Terms")
+
+ggsave(output_file,
+       plot = p,
+       width = max(4, n_terms * 0.1),
+       height = 7,
+       units = "in")
+```

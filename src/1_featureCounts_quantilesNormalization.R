@@ -1,0 +1,449 @@
+#! /usr/bin/env Rscript
+################################################################################
+############################### LOAD LIBRARIES #################################
+library(ChIPQC)
+library(rtracklayer)
+library(preprocessCore)
+library(Rsubread)
+library(tidyverse)
+library(reshape2)
+library(ggpubr)
+library(genomation)
+
+############################## DEFINE FUNCTIONS ################################
+
+# GET CONSENSUS PEAKS
+getConsensusPeaks <- function(peaks) {
+  myPeaks <- lapply(peaks[[1]], ChIPQC:::GetGRanges, simple = TRUE)
+  names(myPeaks) <- peak_samples
+  myGRangesList<-GRangesList(myPeaks) 
+  reduced <- GenomicRanges::reduce(unlist(myGRangesList))###
+  consensusIDs <- paste0("consensus_", seq(1, length(reduced)))
+  mcols(reduced) <- do.call(cbind, lapply(myGRangesList, 
+                                          function(x) (reduced %over% x) + 0))
+  reducedConsensus <- reduced
+  mcols(reducedConsensus) <- cbind(as.data.frame(mcols(reducedConsensus), 
+                                                 optional = TRUE, 
+                                                 make.names = FALSE),
+                                   consensusIDs)
+  consensusIDs <- paste0("consensus_", seq(1, length(reducedConsensus)))
+  blklist <- import.bed("~/Downloads/mm10.blacklist.bed.gz")
+  # remove blk list
+  reducedConsensus <- reducedConsensus[!reducedConsensus %over% blklist & 
+                                         !seqnames(reducedConsensus) %in% "chrM"]
+  
+  regionsToCount <- data.frame(GeneID = paste(seqnames(reducedConsensus),
+                                              start(reducedConsensus), 
+                                              end(reducedConsensus), 
+                                              sep = "_"), 
+                               Chr = seqnames(reducedConsensus), 
+                               Start = start(reducedConsensus), 
+                               End = end(reducedConsensus), 
+                               Strand = strand(reducedConsensus))
+  return(list(reducedConsensus, regionsToCount))
+}
+
+# GET CONSENSUS PEAKS with given universe
+getConsensusPeaks <- function(peaks, univ) {
+  myPeaks <- lapply(peaks[[1]], ChIPQC:::GetGRanges, simple = TRUE)
+  names(myPeaks) <- peak_samples
+  myGRangesList<-GRangesList(myPeaks) 
+  reduced <- readGeneric(univ, chr = 1, start = 2, end = 3,
+                         keep.all.metadata = TRUE, zero.based = FALSE,
+                         remove.unusual = FALSE, header = TRUE, 
+                         skip = 0, sep = "\t")
+  consensusIDs <- paste0("consensus_", seq(1, length(reduced)))
+  mcols(reduced) <- do.call(cbind, lapply(myGRangesList, 
+                                          function(x) (reduced %over% x) + 0))
+  reducedConsensus <- reduced
+  mcols(reducedConsensus) <- cbind(as.data.frame(mcols(reducedConsensus), 
+                                                 optional = TRUE, 
+                                                 make.names = FALSE),
+                                   consensusIDs)
+  consensusIDs <- paste0("consensus_", seq(1, length(reducedConsensus)))
+  blklist <- import.bed("~/Downloads/mm10.blacklist.bed.gz")
+  # remove blk list
+  reducedConsensus <- reducedConsensus[!reducedConsensus %over% blklist & 
+                                         !seqnames(reducedConsensus) %in% "chrM"]
+  
+  regionsToCount <- data.frame(GeneID = paste(seqnames(reducedConsensus),
+                                              start(reducedConsensus), 
+                                              end(reducedConsensus), 
+                                              sep = "_"), 
+                               Chr = seqnames(reducedConsensus), 
+                               Start = start(reducedConsensus), 
+                               End = end(reducedConsensus), 
+                               Strand = strand(reducedConsensus))
+  return(list(reducedConsensus, regionsToCount))
+}
+
+# FEATURE COUNTS & QUANTILES NORMALIZATION
+countFeatures <- function(bams, bamp, regionsToCount){
+  # feature counts for singleton
+  fcs <- featureCounts(bams[[1]],
+                       annot.ext = regionsToCount,
+                       nthreads = 10)
+  # feature counts for paired end 
+  fcp <- featureCounts(bamp[[1]], 
+                       annot.ext = regionsToCount, 
+                       isPairedEnd=TRUE,  
+                       nthreads = 10)
+  # joint matrix
+  fc <- cbind(fcp$counts, fcs$counts)
+  #re-name columns
+  colnames(fc) <- sub("_sort_dedup.bam", "", colnames(fc))
+  fc <- fc[,samples$SampleID]
+  
+  # quantiles normalization
+  fc_norm = normalize.quantiles(fc,copy=TRUE)
+  colnames(fc_norm) <- colnames(fc)
+  rownames(fc_norm) <-rownames(fc)
+  
+  # get normalization factors
+  nfactors = fc/fc_norm
+  nfactors[nfactors == 0] <- 1
+  nfactors[is.na(nfactors)] <- 1
+  
+  return(list(fc, fc_norm, nfactors))
+}
+
+# MELT FEATURE COUNT MATIX
+meltFC <- function(fc, peak_range, renin_samples){
+  fc_melt<-melt(fc[peak_range,]) # +/- 25 peaks around the ren1 SE
+  names(fc_melt) <- c('consensus_peak_ID', 'sample_name', 'counts')
+  # fc_melt <- fc_melt %>% 
+  #   rename(
+  #     consensus_peak_ID = Var1,
+  #     sample_name = Var2,
+  #     counts=value
+  #   )
+  
+  fc_melt <- fc_melt %>%
+    # convert consensus_peak_ID to factor and reverse order of levels
+    mutate(consensus_peak_ID=factor(consensus_peak_ID,
+                                    levels=rev(sort(
+                                      unique(consensus_peak_ID)
+                                    )))) %>%
+    # create a new variable from count
+    mutate(countfactor=cut(counts,breaks=c(-1,0,1,10,100,500,1000,
+                                           max(counts,na.rm=T)),
+                           labels=c("0","0-1","1-10",
+                                    "10-100","100-500",
+                                    "500-1000",">1000"))) %>%
+    # change level order
+    mutate(countfactor=factor(as.character(countfactor),
+                              levels=rev(levels(countfactor)))) %>%
+    # add group info
+    mutate(Group=ifelse(fc_melt$sample_name %in% renin_samples,
+                        "Renin", "Non-Renin_Control"))
+  
+  # calc p values
+  pval_df = data.frame(consensus_peak_ID = rownames(fc[peak_range,]))
+  for (row in 1:nrow(pval_df)) {
+    pval = t.test(fc_melt[fc_melt$consensus_peak_ID == pval_df$consensus_peak_ID[row] 
+                          & fc_melt$Group == "Renin", "counts"], 
+                  fc_melt[fc_melt$consensus_peak_ID == pval_df$consensus_peak_ID[row] 
+                          & fc_melt$Group == "Non-Renin_Control", "counts"], 
+                  var.equal =TRUE)
+    pval_df[row, "pvals"] = pval$p.value
+    if ( pval$p.value > 0.05 ) {
+      pval_df[row, "sig"] =  "> 0.05"
+      pval_df[row, "color"] =  "azure1"
+    } else if ( pval$p.value < 0.05 & pval$p.value >= 0.01 ) {
+      pval_df[row, "sig"] = "< 0.05"
+      pval_df[row, "color"] =  "azure2"
+    } else if ( pval$p.value < 0.01 & pval$p.value >= 0.001 ) {
+      pval_df[row, "sig"] = "< 0.01"
+      pval_df[row, "color"] =  "azure3"
+    } else {
+      pval_df[row, "sig"] = "< 0.001"
+      pval_df[row, "color"] =  "azure4"
+    }
+  }
+  
+  fc_melt = merge(fc_melt, pval_df, by = "consensus_peak_ID")
+  
+  return(fc_melt)
+}
+
+# PLOTS
+# heatmap
+plotHeatmap <- function (fc, peak_range, renin_samples, myDesign, normalization){
+  fc_melt = meltFC(fc, peak_range, renin_samples)
+  title = ifelse(normalization, 
+                 paste(myDesign, "Normalized Counts"), 
+                 paste(myDesign,"Non-normalized Counts"))
+  
+  textcol <- "black"
+  # options(repr.plot.width = 150, repr.plot.height = 1000)
+  plot <-ggplot(fc_melt, aes(consensus_peak_ID, sample_name)) + 
+    geom_tile(mapping = aes(fill = countfactor, width=3, height=3)) +
+    facet_grid(Group ~ ., space="free", scales="free_y", switch="y") +
+    labs(title=title)+
+    guides(fill=guide_legend(title="Counts"))+
+    scale_x_discrete(limits = rev, guide = guide_axis(check.overlap = TRUE))+
+    scale_y_discrete(guide = guide_axis(check.overlap = TRUE))+
+    ylab("samples")+
+    xlab("")+
+    # as4.1_norm colors
+    # scale_fill_manual(values=c("#f46d43","#fdae61",
+    #                            "#fee08b","#e6f598","#abdda4"),
+    #                   na.value = "grey90")+
+
+    scale_fill_manual(values=c("#d53e4f","#f46d43","#fdae61",
+                               "#fee08b","#e6f598","#abdda4","#ddf1da"),
+    na.value = "grey90")+
+    theme_grey(base_size=10)+
+    theme(legend.position="right",legend.direction="vertical",
+          legend.title=element_text(colour=textcol),
+          legend.margin=margin(grid::unit(0,"cm")),
+          legend.text=element_text(colour=textcol,size=6),
+          legend.key.height=grid::unit(0.5,"cm"),
+          legend.key.width=grid::unit(0.2,"cm"),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.text.x=element_text(angle = 90,
+                                   vjust = 0.5,
+                                   hjust=0.5,
+                                   size = 8,
+                                   colour=textcol),
+          # axis.text.x=element_blank(),
+          axis.ticks=element_line(size=0.1),
+          plot.background=element_blank(),
+          panel.border=element_blank(),
+          plot.margin=margin(0.7,0.4,0.1,0.2,"cm"),
+          plot.title=element_text(colour=textcol,hjust=0,size=10)
+          )
+  
+  ggsave(paste(primary_dir,"/fig/",title,".svg", sep=""), 
+         plot=plot, width = 174, height = 174, units = "mm" )
+  
+  plot
+}
+
+# rect plot 
+plotPeaks = function(fc, peak_range, renin_samples, myDesign, normalization){
+  fc_melt = meltFC(fc, peak_range, renin_samples)
+  title = ifelse(normalization, 
+                 paste(myDesign, "Normalized Counts"), 
+                 paste(myDesign,"Non-normalized Counts"))
+  
+  fc_melt$consensus_peak_ID = sub("ID_", "", fc_melt$consensus_peak_ID)
+  fc_melt <- cbind(fc_melt, read.csv(text=fc_melt$consensus_peak_ID, 
+                                     header=FALSE,
+                                     sep = "_",
+                                     col.names=c('Chrom','start','end')))
+  df <- fc_melt %>%
+    group_by(Chrom, start, end, Group) %>%
+    summarise_at(vars(counts), list(avg_counts = mean))
+  pval_df = unique(fc_melt[, c("Chrom", "start","end", "pvals", "sig", "color")])
+  fc_melt = merge(df, pval_df, by = c("Chrom", "start", "end"))
+  fc_melt = fc_melt[order(fc_melt$start),]
+  
+  options(repr.plot.width = 150, repr.plot.height = 50)
+  
+  p_peaks <- ggplot() + 
+    labs(title=title)+
+    geom_rect(data=fc_melt, 
+              mapping=aes(xmin=start, 
+                          xmax=end, 
+                          ymin=avg_counts - 25, 
+                          ymax=avg_counts + 25, 
+                          fill=Group)) +
+    geom_rect(data=fc_melt,
+              mapping=aes(xmin=start,
+                          xmax=end,
+                          ymin= - 100,
+                          ymax=-50,
+                          fill=sig), fill = fc_melt$color) +
+    scale_x_continuous(limits = c(min(fc_melt$start), 
+                                  max(fc_melt$end)), 
+                       breaks = scales::pretty_breaks(n = 45)) +
+    scale_y_continuous(expand = c(0, 0), 
+                       limits = c(-100, 1800),
+                       breaks = scales::pretty_breaks(n = 10)) + 
+    xlab(paste("coordinates: ", fc_melt$Chrom[1], sep = "")) +
+    ylab("Counts")
+  
+  p_peaks + 
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, 
+                                     vjust = 0.5, 
+                                     hjust=0.5, 
+                                     size = 8))
+}
+
+# line plot 
+plotLine = function(fc, peak_range, renin_samples, myDesign, normalization){
+  fc_melt = meltFC(fc, peak_range, renin_samples)
+  title = ifelse(normalization, 
+                 paste(myDesign, "Normalized Counts"), 
+                 paste(myDesign,"Non-normalized Counts"))
+  
+  fc_melt$consensus_peak_ID = sub("ID_", "", fc_melt$consensus_peak_ID)
+  fc_melt <- cbind(fc_melt, read.csv(text=fc_melt$consensus_peak_ID, 
+                                     header=FALSE,
+                                     sep = "_",
+                                     col.names=c('Chrom','start','end')))
+  df1 = fc_melt[, c("Chrom", "start", "sample_name", "counts", 
+                    "countfactor", "Group", "pvals", "sig", "color")]
+  df2 = fc_melt[, c("Chrom", "end", "sample_name", "counts", 
+                    "countfactor", "Group", "pvals", "sig", "color")]
+  df1 = rename(df1, coordinates = start)
+  df2 = rename(df2, coordinates = end)
+  fc_melt = rbind(df1, df2)
+  df <- fc_melt %>%
+    group_by(Chrom, coordinates, Group) %>%
+    summarise_at(vars(counts), list(avg_counts = mean))
+  pval_df = unique(fc_melt[, c("Chrom", "coordinates", "pvals", "sig", "color")])
+  fc_melt = merge(df, pval_df, by = c("Chrom", "coordinates"))
+  fc_melt = fc_melt[order(fc_melt$coordinates),]
+  options(repr.plot.width = 150, repr.plot.height = 50)
+  
+  p_line <- ggplot(fc_melt, aes(color=Group, y=avg_counts, x=coordinates)) + 
+    labs(title=title)+
+    geom_line() +
+    scale_x_continuous(limits = c(min(fc_melt$coordinates), 
+                                  max(fc_melt$coordinates)), 
+                       breaks = scales::pretty_breaks(n = 45)) +
+    xlab(paste("coordinates: ", fc_melt$Chrom[1], sep = "")) +
+    ylab("Counts")
+  
+  p_line + 
+    theme(axis.text.x = element_text(angle = 90, 
+                                     vjust = 0.5, 
+                                     hjust=0.5, 
+                                     size = 8)) +
+    geom_rug(color = fc_melt$color, sides="b", size = 1)
+}
+
+# box plot 
+plotBox = function(fc, peak_range, renin_samples, myDesign, normalization){
+  fc_melt = meltFC(fc, peak_range, renin_samples)
+  fc_melt$consensus_peak_ID = sub("ID_", "", fc_melt$consensus_peak_ID)
+  title = ifelse(normalization, 
+                 paste(myDesign, "Normalized Counts"), 
+                 paste(myDesign,"Non-normalized Counts"))
+  
+  options(repr.plot.width = 150, repr.plot.height = 50)
+  p_box <- ggplot(fc_melt, aes(fill=Group, y=counts, x=consensus_peak_ID)) + 
+    labs(title=title)+
+    geom_boxplot(outlier.size = 0.1, lwd=0.2) +
+    scale_x_discrete(limits = rev) +
+    xlab("Consensus peaks") +
+    ylab("Counts")
+  
+  p_box + 
+    theme(axis.text.x = element_text(angle = 90, 
+                                     vjust = 0.5, 
+                                     hjust=0.5, 
+                                     size = 8)) +
+    geom_rug(color = fc_melt$color, sides="b", size = 1)
+}
+
+################################ DEFINE FILE PATH ##############################
+setwd("/project/shefflab/processed/gomez_atac/results_pipeline/differential")
+# maxinum likelihood universe
+univ = "/scratch/bx2ur/code/bedembed/data/universe/universe.bed"
+
+### renin vs non-renin
+primary_dir = "primary"
+tumoral_dir = "tumoral"
+meta = "~/code/renin_atac/metadata/renin_encode_atac.csv"
+
+### native vs recruited
+recruited = "recruited"
+meta = "~/code/renin_atac/metadata/native_recruited.csv"
+
+################################## LOAD FILES ##################################
+# meta data
+samples <- read.table(meta, header=TRUE, sep = ",")
+samples <- samples[(samples$Group != "Renin_Low"), ] # remove Renin_Low samples
+
+# for renin primary kidney cell vs encode
+# samples <- samples[(samples$Tissue != "As4.1"), ]
+# for renin as4.1 vs encode
+samples <- samples[(samples$Tissue == "As4.1" | samples$Group == "Non-Renin_Control"), ]
+
+# get sample names
+sample_name <- list(samples$SampleID)[[1]]
+
+# list of peak files
+peaks <- list(samples$Peaks)
+peak_samples <- list(samples$SampleID)[[1]]
+
+# separate single and paired reads bam files
+bams.files <- list(samples[(samples$read_type == "single"), "bamReads"])
+bamp.files <- list(samples[(samples$read_type == "paired"), "bamReads"])
+
+#################################### MAIN ######################################
+# get consensus peaks
+output = getConsensusPeaks(peaks, univ)
+reducedConsensus = output[[1]]
+reducedConsensus = reducedConsensus[, sample_name]
+regionsToCount = output[[2]]
+
+# design
+myDesign <- "Renin (primary kidney cell) vs Non-renin control"
+# myDesign <- "Renin (As4.1 cell line) vs Non-renin control"
+# set contract group
+Group <- list(samples$Group)[[1]]
+
+renin_samples <- sample_name[1:6] # for renin primary kidney vs encode
+# renin_samples <- sample_name[1:23] # for renin samples
+
+# counting features & normalizing counts
+output = countFeatures(bams.files, bamp.files, regionsToCount)
+fc = output[[1]]           # pre normalized counts
+fc_norm = output[[2]]      # normalized counts
+nfactors = output[[3]]     # normalization factors
+
+write.table( x = data.frame(output), 
+             file = 'ConsensusPeaks_full.bed', sep="\t", 
+             col.names=FALSE, row.names=FALSE, quote=FALSE )
+
+write.table( x = t(fc_norm), 
+             file = 'ConsensusPeaks_AS_LOW_features.bed', sep="\t", 
+             quote=FALSE )
+# rownames(fc_norm)
+
+df <- data.frame(rownames(fc_norm))
+df %>% 
+  separate(rownames.fc_norm., into = c('chr', 'start', 'end'), sep="_(?=[^_]+$)")
+df[c('chr', 'start', 'end')] <- str_split_fixed(df$rownames.fc_norm, "_", 3)
+df = df[c('chr', 'start', 'end', 'rownames.fc_norm.')]
+
+write.table( x =df, 
+             file = 'gitk_univ/ConsensusPeaks.bed', sep="\t", 
+             quote=FALSE, col.names = FALSE, row.names = FALSE)
+
+# set plot range
+# +/- 25 peaks around the ren1 SE 
+peak_range = 19596:19646
+
+# plot pre-normalized counts
+# heatmap
+plotHeatmap(fc, peak_range, renin_samples, myDesign, normalization = FALSE)
+# box plot 
+plotBox(fc, peak_range, renin_samples, myDesign, normalization = FALSE)
+# line 
+plotLine(fc, peak_range, renin_samples, myDesign, normalization = FALSE)
+# peaks
+plotPeaks(fc, peak_range, renin_samples, myDesign, normalization = FALSE)
+
+
+# plot normalized counts
+# heatmap
+plotHeatmap(fc_norm, peak_range, renin_samples, myDesign, normalization = TRUE)
+# box plot
+plotBox(fc_norm, peak_range, renin_samples, myDesign, normalization = TRUE)
+# line
+plotLine(fc_norm, peak_range, renin_samples, myDesign, normalization = TRUE)
+# peaks
+plotPeaks(fc_norm, peak_range, renin_samples, myDesign, normalization = TRUE)
+
+
+#################################### SAVE ######################################
+# save.image("renin_primary_encode_susztak_atac.RData")
+save.image("renin_encode_atac_tumoral_0723.RData")
+

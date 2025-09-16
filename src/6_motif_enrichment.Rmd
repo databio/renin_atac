@@ -1,0 +1,208 @@
+---
+title: "4. De Novo Motif Enrichment Analyses"
+author: "xue"
+date: "2024-02-27"
+output: html_document
+---
+
+# 4a. Setup environment
+
+## Load packages
+
+```{r}
+library(genomation)
+library(GenomicFeatures)
+library (BSgenome.Mmusculus.UCSC.mm10)
+```
+
+## Set working directory
+
+```{r, setup, include=FALSE}
+wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/gitk_univ"
+knitr::opts_knit$set(root.dir = wd)
+```
+
+## Define file paths
+
+### Set input directory
+
+```{r}
+# non-renin consensus peaks
+bg_bed = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline_PEPATAC/encode_ATAC/summary/ENCODE_ATAC_mm10_consensusPeaks.narrowPeak"
+
+# region set dir 
+bed_dir = "bed"
+
+# motif enrichment result
+meme_dir =  "meme"
+```
+
+### Set output directory
+
+```{r}
+fa_dir = "fasta"
+plot_dir = "plot/motif"
+
+```
+
+# 4b. Generate fasta file from regions sets
+
+```{r}
+# define reference genome
+genome = BSgenome.Mmusculus.UCSC.mm10
+chroms = c("chr1", "chr2","chr3","chr4","chr5",
+          "chr6","chr7","chr8", "chr9", "chr10",
+          "chr11","chr12","chr13","chr14","chr15",
+          "chr16","chr17","chr18","chr19","chrX",
+          "chrY")
+
+# define function to loop through all region sets
+getFasta = function(input_bed){
+  # Modify the file name to change the extension
+  name_bed = basename(input_bed)
+  name_fa = sub("\\.bed$", ".fa", name_bed)  
+  
+  # Construct the output file path
+  if (!dir.exists(fa_dir)) {
+    dir.create(fa_dir, showWarnings = FALSE, recursive = TRUE)
+  }
+  output <- file.path(fa_dir, name_fa)
+  
+  # load peaks
+  df <- read.table(input_bed, header = FALSE, sep = "\t")
+  colnames(df)[1:3] <- c("chr", "start", "end")
+
+  # Remove rows with missing coordinates
+  df <- df[!is.na(df$start) & !is.na(df$end), ]
+  
+  # Convert to GRanges
+  peaks <- makeGRangesFromDataFrame(df, keep.extra.columns = TRUE,
+                                    seqnames.field = "chr",
+                                    start.field = "start",
+                                    end.field = "end",
+                                    starts.in.df.are.0based = FALSE)
+  peaks = subset(peaks, seqnames %in% chroms )
+
+  ## extract sequence
+  seq <- getSeq(genome, peaks)
+
+  ## add names
+  df = as.data.frame(peaks)
+  name = paste(df$seqnames,":",df$start,"-",df$end, sep="")
+  names(seq) <- name
+  writeXStringSet(seq, file=output )
+}
+```
+
+## Generate fasta file for consensus peaks of non-renin background
+
+```{r}
+getFasta(bg_bed)
+```
+
+## Generate fasta files for region sets of interest in renin samples
+
+```{r}
+# Get a list of all files in the input directory
+region_sets = list.files(file.path(bed_dir), full.names = TRUE)
+
+# Use lapply to apply the function to each file in motif_sets
+lapply(region_sets, getFasta)
+
+```
+
+# 4c. Run de novo motif enrichment analyses with SEA from the MEME suite
+
+```{bash}
+
+bash 5_motif_enrichment.sh
+```
+
+# 4d. Plot enriched motifs
+
+```{r}
+plotMotifEnrichment = function(set){
+  input <- file.path(meme_dir, set, "sea.tsv")
+  output <- file.path(plot_dir, paste0(set, "_top20.pdf"))
+  tryCatch(
+    expr = {
+      # load data
+      df = read.csv(input, sep="\t", check.names = FALSE)
+      df = df[1:(nrow(df) - 3), ]
+      df$ID = sub("_.*", "", df$ID)
+      df$ID = factor(df$ID, levels = unique(df$ID))
+      df = df[!duplicated(df$ID), ]
+       
+      # subset only the top 20 motifs
+      if (nrow(df) > 20) {
+        df = df[1:20, ]
+      } 
+      
+      df = df[, c("RANK",	"ID", "TP%",	"LOG_PVALUE")]
+      df$`-LOG_PVALUE` = -df$LOG_PVALUE
+      df$`-LOG_PVALUE` = as.numeric(as.character(df$`-LOG_PVALUE`))
+      df$`TP%` = as.numeric(as.character(df$`TP%`))
+
+      # plot the data
+      scaleFactor <- max(df$`-LOG_PVALUE`) / 100
+      # Create plot
+      p = ggplot()+
+        geom_bar(data=df, 
+                 aes(x = ID, y = `-LOG_PVALUE`), 
+                 stat="identity", 
+                 fill = "grey", 
+                 width = 0.8) +
+        geom_line(data=df, 
+                  aes(x=ID, y=`TP%`* scaleFactor, group = 1), 
+                  color = "black", 
+                  size = 0.25) +
+        geom_point(data=df, 
+                   aes(x=ID, y = `TP%`* scaleFactor, group = 1), 
+                   shape = 21, 
+                   color="black", 
+                   fill = "white", 
+                   size = 2, 
+                   stroke = 0.5) +
+        geom_text(data = df, 
+                  aes(x = ID, 
+                      y = `TP%` * scaleFactor, 
+                      label = paste(round(`TP%`, 2), "%")
+                      ), 
+                  angle = 90,
+                  hjust = -0.2, 
+                  size = 2.5, 
+                  color = "black") +  # Add this geom_text layer
+        scale_y_continuous(name="-log10(p-value)", 
+                           expand = c(0,0.1, 0.1, 0)) +
+        ggtitle(set) +
+        theme(axis.text.x = element_text(angle = 90, 
+                                         vjust = 0.5, 
+                                         hjust = 1, 
+                                         size = 12, 
+                                         color = "black"),
+              axis.text.y = element_text(angle = 90, 
+                                         vjust = 0.5, 
+                                         hjust = 0.5, 
+                                         size = 10,
+                                         color = "black"),
+              panel.grid = element_blank(), 
+              panel.background = element_rect(color = "black", fill = NA))
+      
+      ggsave(output, p, width = 3.5, height = 2.25)
+    },
+    error = function(e){
+      message('Caught an error!')
+      print(e)
+    }
+  )
+}
+```
+
+```{r}
+# Get a list of all files in the input directory
+motif_sets = list.files(file.path(meme_dir))
+
+# Use lapply to apply the function to each file in motif_sets
+lapply(motif_sets, plotMotifEnrichment)
+
+```

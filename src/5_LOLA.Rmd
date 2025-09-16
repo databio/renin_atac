@@ -1,0 +1,142 @@
+---
+title: "LOLA enrichment Analysis"
+author: "xue"
+date: "2025-08-14"
+output: html_document
+---
+
+This document 1) performs the LOLA analysis on differentially accessible regions in renin-expressing samples, and 2) generate some diagnostic plots.
+
+# 5a. Setup environment
+
+## Load packages
+
+```{r}
+library(LOLA)
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(forcats)
+library(GenomicRanges)
+```
+
+## Set working directory
+
+```{r}
+wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/gitk_univ"
+knitr::opts_knit$set(root.dir = wd)
+```
+
+## Define file paths
+
+### Set input path
+
+```{r}
+# LOLA core mm10 database
+dbPath = "/project/shefflab/LOLAweb/databases/LOLACore/mm10"
+# input bed file fir
+bed_dir = "bed"
+# Universe file
+univ_bed = "/home/bx2ur/code/reninness_score/data/universe/universe.bed"
+
+# renin related differentially accessibile regions
+bed_paths = list(
+  # WT
+  wt_up_bed = file.path(bed_dir, "deseq_wt_all_diff_up.bed"),
+  wt_down_bed = file.path(bed_dir, "deseq_wt_all_diff_down.bed"),
+  # Recruited
+  rc_up_bed = file.path(bed_dir, "deseq_recruited_all_diff_up.bed"),
+  rc_down_bed = file.path(bed_dir, "deseq_recruited_all_diff_down.bed"),
+  # Tumoral
+  t_up_bed = file.path(bed_dir, "deseq_tumoral_all_diff_up.bed"),
+  t_down_bed = file.path(bed_dir, "deseq_tumoral_all_diff_down.bed"),
+  # Renin specific regions: increased accessibility regions shared in at lease two sample groups
+  rs_bed = file.path(bed_dir, "renin_specific_regions.bed")
+)
+```
+
+### Set output path
+
+```{r}
+# LOLA result output
+outdir = "lolaResults_4groups"
+#dir.create(outdir, showWarnings = FALSE)
+
+# plot outout
+outplot = file.path("plot", "lola_userSet_plots") 
+#dir.create(outplot, showWarnings = FALSE)
+```
+
+## Load input files
+
+```{r}
+# load LOLA core database
+regionDB = loadRegionDB(dbPath)
+# Load universe
+userUniverse = readBed(univ_bed)
+
+# Load all GRanges into list
+renin_regions = GRangesList(lapply(bed_paths, function(f) readBed(f)))
+```
+
+# 5b. Run LOLA analysis
+
+```{r}
+locResults = runLOLA(renin_regions, userUniverse, regionDB, cores = 1)
+
+# filter significant enrichment
+enrich_filtered = locResults %>%
+  filter(pValueLog > 2)
+
+writeCombinedEnrichment(locResults, outFolder= outdir, includeSplits=TRUE)
+```
+
+# 5c. Plot LOLA results
+
+```{r}
+# define functions
+
+plot_userSet = function(user_set_name, df, outdir) {
+  df_subset = df %>%
+    filter(userSet == user_set_name) %>%
+    group_by(collection) %>%
+    arrange(maxRnk) %>%
+    slice_head(n = 20) %>%
+    ungroup() %>%
+    mutate(
+      combined_label = paste(cellType, antibody, sep = ":"),
+      combined_label = factor(combined_label, levels = rev(unique(combined_label))),
+      neg_log10p = pValueLog
+    )
+
+  p = ggplot(df_subset, aes(x = neg_log10p, y = combined_label)) +
+    geom_bar(stat = "identity", fill = "lightgrey") +
+    facet_wrap(~collection, scales = "free_y", ncol = 1) +
+    theme_bw() +
+    labs(
+      title = paste("LOLA Enrichment for", user_set_name),
+      x = expression(-log[10](p)),
+      y = "Cell type : Antibody"
+    ) +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      strip.text = element_text(face = "bold"),
+      axis.text.y = element_text(size = 8),
+      plot.title = element_text(hjust = 0.5, size = 14)
+    )
+
+  outfile = file.path(outdir, paste0("lola_enrichment_", user_set_name, ".pdf"))
+  ggsave(outfile, plot = p, width = 8, height = 10)
+  message("Saved: ", outfile)
+}
+```
+
+```{r}
+# generate plots
+# Loop over user sets
+unique_userSets = unique(enrich_filtered$userSet)
+for (u in unique_userSets) {
+  plot_userSet(u, enrich_filtered, outplot)
+}
+```

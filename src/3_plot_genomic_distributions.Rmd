@@ -1,0 +1,582 @@
+---
+title: "3. Plot Genomic Distributions"
+author: "xue"
+date: "2024-02-27"
+output: html_document
+---
+
+This document generates GenomicDictribution plots for region set of interest defined based on the DESeq2 differential accessibility analysis.
+
+# 3a. Setup environment
+
+## Load packages
+
+```{r}
+library("genomation")
+library("GenomicDistributions")
+library("GenomicDistributionsData")
+library("UpSetR")
+library("gplots")
+library("tidyverse")
+library(BioVenn)
+```
+
+## Set working directory
+
+```{r, setup, include=FALSE}
+wd = "/project/shefflab/processed/gomez_atac/results_pipeline/differential/gitk_univ"
+knitr::opts_knit$set(root.dir = wd)
+```
+
+## Define file paths
+
+### Set input directory
+
+```{r}
+# WT: primary renin cells in their basal state
+pn_file = "deseq/deseq_normal_primary_report_shrink.csv"
+# Recruited: primary renin cells that were chronically stimulated or genetically modified to enhance renin production (recruited, ASKO, and Ren1KO)
+ph_file = "deseq/deseq_high_primary_report_shrink.csv"
+# Tumoral: tumoral cell line (As4.1) that exhibited constitutive renin expression.  
+th_file = "deseq/deseq_normal_tumoral_report_shrink.csv"
+```
+
+### Set output directory
+
+```{r}
+# output path for the bed files of region sets of interest
+bed_dir = "bed"
+
+# group by change in accessibility and sample groups 
+# decreased accessibility regions in WT samples
+pn_down_bed = file.path(bed_dir, "deseq_wt_all_diff_down.bed")
+# increased accessibility regions in WT samples
+pn_up_bed = file.path(bed_dir, "deseq_wt_all_diff_up.bed")
+
+# decreased accessibility regions in recruited samples
+ph_down_bed = file.path(bed_dir, "deseq_recruited_all_diff_down.bed")
+# increased accessibility regions in recruited samples
+ph_up_bed = file.path(bed_dir, "deseq_recruited_all_diff_up.bed")
+
+# decreased accessibility regions in tumoral samples
+th_down_bed = file.path(bed_dir, "deseq_tumoral_all_diff_down.bed") 
+# increased accessibility regions in tumoral samples
+th_up_bed = file.path(bed_dir, "deseq_tumoral_all_diff_up.bed")
+
+# group by change in accessibility and regions shared among sample groups
+# decreased accessibility regions only in wt samples 
+pn_down_only_bed = file.path(bed_dir, "deseq_wt_only_diff_down.bed")
+# increased accessibility regions only in tumoral samples 
+pn_up_only_bed = file.path(bed_dir, "deseq_wt_only_diff_up.bed")
+
+# decreased accessibility regions only in wt samples 
+ph_down_only_bed = file.path(bed_dir, "deseq_recruited_only_diff_down.bed")
+# increased accessibility regions only in tumoral samples 
+ph_up_only_bed = file.path(bed_dir, "deseq_recruited_only_diff_up.bed")
+
+# decreased accessibility regions only in tumoral samples 
+th_down_only_bed = file.path(bed_dir, "deseq_tumoral_only_diff_down.bed")
+# increased accessibility regions only in tumoral samples 
+th_up_only_bed = file.path(bed_dir, "deseq_tumoral_only_diff_up.bed")
+
+# decreased accessibility regions shared in wt and recruited
+pn_ph_down_bed = file.path(bed_dir, "deseq_wt_recruited_diff_down.bed")
+# decreased accessibility regions shared in wt and tumoral
+pn_th_down_bed = file.path(bed_dir, "deseq_wt_tumoral_diff_down.bed")
+# decreased accessibility regions shared in recruited and tumoral
+ph_th_down_bed = file.path(bed_dir, "deseq_recruited_tumoral_diff_down.bed")
+# decreased accessibility regions shared in all three 
+all_3_down_bed = file.path(bed_dir, "deseq_all_3_diff_down.bed")
+
+# increased accessibility regions shared in wt and recruited
+pn_ph_up_bed = file.path(bed_dir, "deseq_wt_recruited_diff_up.bed")
+# increased accessibility regions shared in wt and tumoral
+pn_th_up_bed = file.path(bed_dir, "deseq_wt_tumoral_diff_up.bed")
+# increased accessibility regions shared in recruited and tumoral
+ph_th_up_bed = file.path(bed_dir, "deseq_recruited_tumoral_diff_up.bed")
+# increased accessibility regions shared in all three 
+all_3_up_bed = file.path(bed_dir, "deseq_all_3_diff_up.bed")
+
+# Renin specific regions: increased accessibility regions shared in at lease two sample groups
+rs_bed = file.path(bed_dir, "renin_specific_regions.bed")
+
+output_list = list(pn_up_only_bed, ph_up_only_bed, th_up_only_bed,
+             pn_down_only_bed, ph_down_only_bed, th_down_only_bed,
+             pn_th_up_bed, ph_th_up_bed, pn_ph_up_bed,
+             all_3_up_bed, rs_bed,
+             pn_th_down_bed, ph_th_down_bed, pn_ph_down_bed,
+             all_3_down_bed)
+```
+
+```{r}
+# output path for plots
+plot_dir = "plot"
+
+# upset plot
+upset_path = file.path(plot_dir, "upset.svg")
+
+# GenomicDistributions Plots
+gd_dir = "GD"
+
+dc = "distOverChroms" # Regions distribution over chromosomes plot
+tss = "TSS" # Region-TSS distance plot
+gp = "distOverPartitions" # Regions distribution over genomic partitions plot
+ep = "expDistOverPartitions" # Expected distribution over genomic partitions plot
+cp = "cumDistOverPartitions" # Cumulative distribution over genomic partitions plot
+cs = "cellSpecific_encode_mm10" # Cell specific enrichment for open chromatin plot
+nd = "neighborDist" # Distance between neighbor regions
+gc = "GcContent" # GC content plot
+wh = "widthHist" # Quantile-trimmed histogram of widths
+
+# decreased accessibility regions in WT samples
+pn_down_plot = "deseq_wt_all_diff_down.pdf"
+# increased accessibility regions in WT samples
+pn_up_plot = "deseq_wt_all_diff_up.pdf"
+
+# decreased accessibility regions in recruited samples
+ph_down_plot = "deseq_recruited_all_diff_down.pdf"
+# increased accessibility regions in recruited samples
+ph_up_plot = "deseq_recruited_all_diff_up.pdf"
+
+# decreased accessibility regions in tumoral samples
+th_down_plot = "deseq_tumoral_all_diff_down.pdf" 
+# increased accessibility regions in tumoral samples
+th_up_plot = "deseq_tumoral_all_diff_up.pdf"
+
+## group by change in accessibility and regions shared among sample groups
+
+# decreased accessibility regions only in wt samples 
+pn_down_only_plot = "deseq_wt_only_diff_down.pdf"
+# increased accessibility regions only in tumoral samples 
+pn_up_only_plot = "deseq_wt_only_diff_up.pdf"
+
+# decreased accessibility regions only in wt samples 
+ph_down_only_plot = "deseq_recruited_only_diff_down.pdf"
+# increased accessibility regions only in tumoral samples 
+ph_up_only_plot = "deseq_recruited_only_diff_up.pdf"
+
+# decreased accessibility regions only in tumoral samples 
+th_down_only_plot = "deseq_tumoral_only_diff_down.pdf"
+# increased accessibility regions only in tumoral samples 
+th_up_only_plot = "deseq_tumoral_only_diff_up.pdf"
+
+# decreased accessibility regions shared in wt and recruited
+pn_ph_down_plot = "deseq_wt_recruited_diff_down.pdf"
+# decreased accessibility regions shared in wt and tumoral
+pn_th_down_plot = "deseq_wt_tumoral_diff_down.pdf"
+# decreased accessibility regions shared in recruited and tumoral
+ph_th_down_plot = "deseq_recruited_tumoral_diff_down.pdf"
+# decreased accessibility regions shared in all three 
+all_3_down_plot = "deseq_all_3_diff_down.pdf"
+
+# increased accessibility regions shared in wt and recruited
+pn_ph_up_plot = "deseq_wt_recruited_diff_up.pdf"
+# increased accessibility regions shared in wt and tumoral
+pn_th_up_plot = "deseq_wt_tumoral_diff_up.pdf"
+# increased accessibility regions shared in recruited and tumoral
+ph_th_up_plot = "deseq_recruited_tumoral_diff_up.pdf"
+# increased accessibility regions shared in all three 
+all_3_up_plot = "deseq_all_3_diff_up.pdf"
+
+# Renin specific regions: increased accessibility regions shared in at lease two sample groups
+rs_plot = "renin_specific_regions.pdf"
+
+plot_list = list(pn_up_plot, ph_up_plot, th_up_plot, 
+                 pn_down_plot, ph_down_plot, th_down_plot, 
+                 pn_up_only_plot, ph_up_only_plot, th_up_only_plot,
+                 pn_down_only_plot, ph_down_only_plot, th_down_only_plot,
+                 pn_th_up_plot, ph_th_up_plot, pn_ph_up_plot, 
+                 all_3_up_plot, rs_plot,
+                 pn_th_down_plot, ph_th_down_plot, pn_ph_down_plot, 
+                 all_3_down_plot)
+```
+
+## Load input files
+
+```{r}
+# load differential accessibility regions in WT samples 
+pn <- readGeneric(pn_file, chr = 1, start = 2, end = 3,
+                              keep.all.metadata = TRUE, zero.based = FALSE,
+                              remove.unusual = FALSE, header = TRUE, 
+                              skip = 0, sep = ",")
+
+# load differential accessibility regions in Recruited and KO samples 
+ph <- readGeneric(ph_file, chr = 1, start = 2, end = 3,
+                            keep.all.metadata = TRUE, zero.based = FALSE,
+                            remove.unusual = FALSE, header = TRUE, 
+                            skip = 0, sep = ",")
+
+# load differential accessibility regions in tumoral samples 
+th <- readGeneric(th_file, chr = 1, start = 2, end = 3,
+                         keep.all.metadata = TRUE, zero.based = FALSE,
+                         remove.unusual = FALSE, header = TRUE, 
+                         skip = 0, sep = ",")
+```
+
+# 3b. Define region sets of interest
+
+## Filter deferential accessibility regions
+
+```{r}
+# define funtion
+filterRegions <- function(gr, foldChange, fdr, output_path) {
+  # Arguments:
+  # gr: grange object.
+  # foldChange: Numeric, threshold for abs fold change.
+  # fdr: Numeric, threshold for FDR.
+  # output_path: List, output paths for increased and decreased regions.
+  gr  <- subset(gr, pvalue < fdr )
+  # Filter significantly increased accessibility regions
+  print("Filtering significantly increased accessibility regions")
+  gr_up <- subset(gr, log2FoldChange >= absFoldChange)
+  gr_up = as.data.frame(gr_up)[,c("seqnames", "start", "end")]
+  gr_up$name <- paste(gr_up$seqnames, gr_up$start, gr_up$end, sep = "_")
+  print("Saving regions as bed format")
+  write.table(gr_up[, c("seqnames", "start", "end", "name")],
+              file = output_path$increase, sep = "\t",
+              col.names = FALSE, row.names = FALSE, quote = FALSE)
+  
+  # Filter significantly decreased accessibility regions
+  print("Filtering significantly decreased accessibility regions")
+  gr_down <- subset(gr, log2FoldChange <= -absFoldChange)
+  gr_down = as.data.frame(gr_down)[,c("seqnames", "start", "end")]
+  gr_down$name <- paste(gr_down$seqnames, gr_down$start, gr_down$end, sep = "_")
+  print("Saving regions as bed format")
+  write.table(gr_down[, c("seqnames", "start", "end", "name")],
+              file = output_path$decrease, sep = "\t",
+              col.names = FALSE, row.names = FALSE, quote = FALSE)
+  
+  return (list(gr_up, gr_down))
+}
+```
+
+```{r}
+# set filters 
+absFoldChange = 2
+fdr = 0.01
+
+# filter regions in WT samples
+output_path = list(
+  increase = pn_up_bed,
+  decrease = pn_down_bed
+)
+
+gr_list = filterRegions(pn, absFoldChange, fdr, output_path)
+pn_up = gr_list[[1]]
+pn_down = gr_list[[2]]
+
+# filter regions in Recruited samples
+output_path = list(
+  increase = ph_up_bed,
+  decrease = ph_down_bed
+)
+
+gr_list = filterRegions(ph, absFoldChange, fdr, output_path)
+ph_up = gr_list[[1]]
+ph_down = gr_list[[2]]
+
+# filter regions in Tumoral samples
+output_path = list(
+  increase = th_up_bed,
+  decrease = th_down_bed
+)
+
+gr_list = filterRegions(th, absFoldChange, fdr, output_path)
+th_up = gr_list[[1]]
+th_down = gr_list[[2]]
+```
+
+## Summarizing significantly differentially accessible regions
+
+## Visualizing with upset plot
+
+```{r}
+listInput = list(WT_up = pn_up$name,
+                     recruited_up = ph_up$name,
+                     tumoral_up = th_up$name,
+                     WT_down = pn_down$name,
+                     recruited_down = ph_down$name,
+                     tumoral_down = th_down$name
+                 )
+
+upset_plot <- upset(fromList(listInput), 
+                    mainbar.y.label = "overlapped regions",
+                    sets = c("WT_up", "recruited_up", "tumoral_up", 
+                             "WT_down", "recruited_down", "tumoral_down"),
+                    keep.order = TRUE, order.by = "freq", 
+                    text.scale = c(1.5,1.5,1.5,1.5,1.75,1.5)
+                    )
+# ggsave(upset_path, ggplotify::as.ggplot(upset_plot))
+upset_plot
+```
+
+## Create bed files for each of the vertical region set in the upset plot
+
+```{r}
+# defined region sets
+itemList <- venn(listInput, show.plot=FALSE)
+
+pn_up_only = attributes(itemList)$intersections$WT_up
+ph_up_only = attributes(itemList)$intersections$recruited_up
+th_up_only = attributes(itemList)$intersections$tumoral_up
+
+pn_down_only = attributes(itemList)$intersections$WT_down
+ph_down_only = attributes(itemList)$intersections$recruited_down
+th_down_only = attributes(itemList)$intersections$tumoral_down
+
+pn_th_up = attributes(itemList)$intersections$`WT_up:tumoral_up`
+ph_th_up = attributes(itemList)$intersections$`recruited_up:tumoral_up`
+pn_ph_up = attributes(itemList)$intersections$`WT_up:recruited_up`
+
+all_3_up = attributes(itemList)$intersections$`WT_up:recruited_up:tumoral_up`
+
+# Renin specific regions: increased accessibility regions shared in at lease two sample groups
+rs = c(pn_th_up, ph_th_up, pn_ph_up, all_3_up)
+
+pn_th_down = attributes(itemList)$intersections$`WT_down:tumoral_down`
+ph_th_down = attributes(itemList)$intersections$`recruited_down:tumoral_down`
+pn_ph_down = attributes(itemList)$intersections$`WT_down:recruited_down`
+
+all_3_down = attributes(itemList)$intersections$`WT_down:recruited_down:tumoral_down`
+
+set_list =  list(pn_up_only,
+             ph_up_only,
+             th_up_only,
+             pn_down_only,
+             ph_down_only,
+             th_down_only,
+             pn_th_up,
+             ph_th_up,
+             pn_ph_up,
+             all_3_up,
+             rs,
+             pn_th_down,
+             ph_th_down,
+             pn_ph_down, 
+             all_3_down)
+```
+
+```{r}
+# define function to:
+# 1: save region set to bed file
+# 2: conver the list of regions to grange obj for downstream analysis 
+
+listToGrange = function(regions, output){
+  # Arguments:
+  # regions: region set.
+  # output: output path.
+
+  df = do.call(cbind.data.frame, list(regions))
+  colnames(df) = c("ranges")
+  df = df %>% 
+    extract("ranges", c("seqnames", "start", "end"), 
+            regex = "(.*)_([^_]+)_([^_]+)$", remove = FALSE)
+  df = df %>% relocate("ranges", .after = last_col())
+
+  write.table( x = df,
+               file = output,
+               sep="\t",
+               col.names=FALSE, row.names=FALSE, quote=FALSE )
+  
+  myGRange = makeGRangesFromDataFrame(df,
+                                      seqnames.field = "seqnames",
+                                      start.field = "start",
+                                      end.field = "end")
+
+  return(myGRange)
+}
+```
+
+```{r}
+pn_up_gr = makeGRangesFromDataFrame(pn_up,
+                                      seqnames.field = "seqnames",
+                                      start.field = "start",
+                                      end.field = "end")
+ph_up_gr = makeGRangesFromDataFrame(ph_up,
+                                      seqnames.field = "seqnames",
+                                      start.field = "start",
+                                      end.field = "end")
+th_up_gr = makeGRangesFromDataFrame(th_up,
+                                      seqnames.field = "seqnames",
+                                      start.field = "start",
+                                      end.field = "end")
+pn_down_gr = makeGRangesFromDataFrame(pn_down,
+                                      seqnames.field = "seqnames",
+                                      start.field = "start",
+                                      end.field = "end")
+ph_down_gr = makeGRangesFromDataFrame(ph_down,
+                                      seqnames.field = "seqnames",
+                                      start.field = "start",
+                                      end.field = "end")
+th_down_gr = makeGRangesFromDataFrame(th_down,
+                                      seqnames.field = "seqnames",
+                                      start.field = "start",
+                                      end.field = "end")
+# save denfined region set as bed files
+gr_list = list(pn_up_gr, ph_up_gr, th_up_gr, pn_down_gr, ph_down_gr, th_down_gr)
+for (i in 1:length(set_list)) {
+  gr_list = c(gr_list, listToGrange(set_list[[i]], output_list[[i]]))
+}
+  
+```
+
+# 3c. Visualizing with GenomicDistributions
+
+```{r}
+# define function to:
+# 1: plot all GD plots
+# 2: save all plots
+
+plotAllGD = function(gr, output){
+  # Arguments:
+  # regions: region set.
+  # output: output path.
+  
+  # Regions distribution over chromosomes plot
+   tryCatch(
+      expr = {
+        # First, calculate the distribution:
+        x = calcChromBinsRef(gr, "mm10")
+        chrom = c("chr1", "chr2","chr3","chr4","chr5",
+                  "chr6","chr7","chr8", "chr9", "chr10",
+                  "chr11","chr12","chr13","chr14","chr15",
+                  "chr16","chr17","chr18","chr19","chrX",
+                  "chrY")
+        x = x[x$chr %in% chrom,]
+        savePlots(dc, output, plotChromBins(x))
+        
+        message("Successfully calculated and plot chromosomes region distribution.")
+      },
+      error = function(e){
+        message('Caught an error!')
+        print(e)
+      }
+    ) 
+  
+  # Region-TSS distance plot
+  tryCatch(
+      expr = {
+       TSSdist = calcFeatureDistRefTSS(gr, "mm10")
+       savePlots(tss, output, plotFeatureDist(TSSdist, featureName="TSS"))
+       message("Successfully calculated and plot TSS distance.")
+      },
+      error = function(e){
+        message('Caught an error!')
+        print(e)
+      }
+    ) 
+  
+  # Regions distribution over genomic partitions plot
+  tryCatch(
+    expr = {
+     gp1 = calcPartitionsRef(gr, "mm10")
+     savePlots(gp, output, plotPartitions(gp1))
+     message("Successfully calculated and plot regions distribution over genomic partitions.")
+    },
+    error = function(e){
+      message('Caught an error!')
+      print(e)
+    }
+  ) 
+
+  # Expected distribution over genomic partitions plot
+  tryCatch(
+    expr = {
+     ep1 = calcExpectedPartitionsRef(gr, "mm10")
+     savePlots(ep, output, plotExpectedPartitions(ep1))
+     message("Successfully calculated and plot expected distribution over genomic partitions.")
+    },
+    error = function(e){
+      message('Caught an error!')
+      print(e)
+    }
+  )
+
+  # Cumulative distribution over genomic partitions plot
+  tryCatch(
+    expr = {
+     cp1 = calcCumulativePartitionsRef(gr, "mm10")
+     savePlots(cp, output, plotCumulativePartitions(cp1))
+     message("Successfully calculated and plot cumulative distribution over genomic partitions.")
+    },
+    error = function(e){
+      message('Caught an error!')
+      print(e)
+    }
+  )
+  
+  # Cell specific enrichment for open chromatin plot
+  tryCatch(
+      expr = {
+        openSignalMatrix_mm10 = read.table("encode_mm10_meanCoverage_percentile99_01_quantNormalized_round4d.txt", header=TRUE)
+        op = calcSummarySignal(gr, openSignalMatrix_mm10)
+        # get cell type metadata from GenomicDistributions
+        cellTypeMetadata = cellTypeMetadata
+        p = plotSummarySignal(op, metadata = cellTypeMetadata, plotType = "violinPlot")+
+          ylim(0, 1)
+        savePlots(cs, output, p)
+        message("Successfully calculated and plot cell specific enrichment for open chromatin.")
+        },
+      error = function(e){
+        message('Caught an error!')
+        print(e)
+      }
+    ) 
+  
+  # Distance between neighbor regions
+  tryCatch(
+    expr = {
+      nd1 = calcNeighborDist(gr)
+      savePlots(nd, output, plotNeighborDist(nd1))
+      message("Successfully calculated and plot distance between neighbor regions.")
+    },
+    error = function(e){
+      message('Caught an error!')
+      print(e)
+    }
+  )
+  
+  # GC content plot
+  tryCatch(
+    expr = {
+     gc1 = calcGCContentRef(gr, "mm10")
+     savePlots(gc, output, plotGCContent(gc1))
+     message("Successfully calculated and plot GC content.")
+    },
+    error = function(e){
+      message('Caught an error!')
+      print(e)
+    }
+  )
+   
+  # Quantile-trimmed histogram of widths
+  tryCatch(
+    expr = {
+      qt1 = calcWidth(gr)
+      savePlots(wh, output, plotQTHist(qt1))
+      message("Successfully calculated and plot quantile-trimmed histogram of widths.")
+    },
+    error = function(e){
+      message('Caught an error!')
+      print(e)
+    }
+  )
+}
+
+
+savePlots = function(plotId, output, g){
+  pth = file.path(plot_dir, gd_dir, plotId, output)
+  print(paste0("Plotting: ", pth))
+  ggplot2::ggsave(pth, g, device="pdf", width=8, height=8, units="in")
+}
+
+```
+
+```{r}
+# plot and save GD plots
+
+for (i in 1:length(gr_list)) {
+  plotAllGD(gr_list[[i]], plot_list[[i]])
+}
+  
+```

@@ -1,0 +1,426 @@
+---
+title: "5. Evaluating reninness scoring tool"
+author: "xue"
+date: "2024-02-27"
+output: html_document
+---
+
+# 5a. Setup environment
+
+## Load packages
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(ggsignif)
+library(tidyverse)
+library(Rtsne)
+library(RColorBrewer)
+library(MASS)
+
+```
+
+## Set working directory
+
+```{r, setup, include=FALSE}
+wd = "/project/shefflab/processed/gomez_atac/results_pipeline/differential/gitk_univ"
+knitr::opts_knit$set(root.dir = wd)
+```
+
+## Define file paths
+
+### Set input directory
+
+```{r}
+# path of the scATAC figment files
+scATAC_dir = "scATAC"
+# path of the pseudo-bulk data 
+pseudobulk_dir = "pseudobulk_data"
+# path of the pseudo-bulk data by predefined cell type clusters
+cluster_dir = file.path(pseudobulk_dir,"cell_type_cluster")
+# cluster barcodes table
+cluster_barcode = file.path(scATAC_dir,"cluster_barcode_2024-01-29.csv")
+
+# path for reninness score results
+reninScore_dir = "/scratch/bx2ur/code/reninness_score/outputs"
+# bulkATAC
+bulk_res = file.path(reninScore_dir,"gitk_univ")
+# pseudo-bulk: pre-defined cell type clusters
+cluster_res = file.path(reninScore_dir,"pseudobulk")
+# pseudo-bulk: cell barcode
+sc_res = file.path(reninScore_dir,"singlecell")
+
+# file name for starspace embedding docs
+doc_embed = "train_starspace_embed_mm10.txt"
+word_embed = "starspace_model_mm10.tsv"
+
+```
+
+### Set output directory
+
+```{r}
+# path to save the bed files for the pseudo-bulk data by cell barcode
+barcode_dir = file.path(pseudobulk_dir,"cell_barcodes")
+
+# path to save plots
+plot_dir = "plot/reninness_score"
+bar_plt = "bar"
+tsne_plt = "tsne"
+```
+
+## Define functions
+
+```{r}
+# get the embeddings from raw starspace outputs 
+getEmbeddingMatrix = function(path_embeded_document, path_word_embedding, no_labels){
+  sample_embedding = getSampleEmbedding(path_embeded_document)
+  label_embedding = getLabelEmbedding(path_word_embedding, no_labels)
+    
+  embedding = rbind(sample_embedding$X, setNames(label_embedding$X, names(sample_embedding$X)))
+  embedding = apply(embedding, 2, as.numeric)
+  embedding = as.matrix(embedding)
+  
+  labels = c(sample_embedding$y, label_embedding$y)
+  
+  return(list(X = embedding, y = labels))
+}
+
+getSampleEmbedding = function(path_embeded_document) {
+  # get the embedding for the samples
+  
+  # read the raw starspace embeding
+  # odd rows are regions+label for each sample
+  # even rows are embeddings 
+  document_embedding = read.table(path_embeded_document, header = FALSE,  skip = 4, sep = ",")
+  # split out the label col
+  document_embedding = separate(document_embedding, V1, c("text", "label"), sep = "__label__")
+  # shift the label col 1 row down: label and the embedings are now in the same row
+  document_embedding$label = c(NA, document_embedding$label[-nrow(document_embedding)])
+  # remove the rows with regions
+  document_embedding = document_embedding[c(FALSE, TRUE), ]
+  
+  # get sample embedings table
+  X = as.data.frame(do.call(rbind, strsplit(as.character(document_embedding$text), " ")))
+  # get list of labels
+  y = document_embedding$label
+  
+  return(list(X = X, y = y))
+}
+
+getLabelEmbedding = function(path_word_embedding, no_labels) {
+  # get the embedding for the trained labels
+  
+  word_embedding = read.table(path_word_embedding, header = FALSE, sep = "\t")
+  embedding = tail(word_embedding, no_labels)
+  
+  label_embedding = embedding[, -(1:1)]
+  labels = gsub("__label__", "", as.character(embedding$V1))
+  
+  return(list(X = label_embedding, y = labels))
+}
+
+```
+
+```{r}
+# visulization
+plotEmbedding <- function(input_data, scores_df, labels, n_labels, plot_type = "tsne", n_neighbours, metric = 'cosine', model = NULL, output) {
+  set.seed(16)
+  
+  if (!is.null(model)) {
+    reduced_data <- predict(model, newdata = input_data)
+  } else {
+    if (plot_type == "umap") {
+      model <- umap(input_data, n_neighbors = n_neighbours, metric = metric)
+      reduced_data <- model$layout
+    } else if (plot_type == "tsne") {
+      model <- Rtsne(input_data, dims = 2, perplexity = n_neighbours, verbose = TRUE, check_duplicates = FALSE)
+      reduced_data <- model$Y
+    } else if (plot_type == "pca") {
+      model <- prcomp(input_data)
+      reduced_data <- model$x[, 1:2]
+    }
+  }
+  
+  data <- data.frame(dim1 = reduced_data[, 1], dim2 = reduced_data[, 2], label = as.character(labels), score = as.numeric(scores_df$score))
+
+  # Define markers based on label
+  data$marker <- ifelse(data$label == "Renin", "o", "s")
+  # Identify the index of the trained labels
+  idx <- nrow(data) - n_labels+1 : n_labels
+  # plot the trained label with triangel
+
+  data[idx, "marker"] = "^"
+    
+  # Define color gradient
+  limit <- max(abs(data$score)) * c(-1, 1)
+  palette <- colorRampPalette(c("#3274a1", "#d2d2d2", "#e1812c"))
+  
+  # Create a color scale
+  data <- data[order(data$score), ]
+  color_scale <- palette(nrow(data))
+  data$color = color_scale
+  
+  print(data)
+  
+  p <- ggplot(data, aes(x = dim1, y = dim2, group = label, size = 1)) +
+    geom_point(aes(color = color, shape = marker)) +
+    scale_color_identity() +
+    scale_shape_identity() +
+    
+    labs(color = "Color Legend", shape = "Shape Legend")
+  # 
+  #   # ggsave(paste0(output_folder, filename), plot = p, width = 8, height = 8)
+  # 
+  print(p)
+  # 
+  # 
+  #   return(model)
+
+}
+```
+
+```{r}
+# Plot reninness score
+plotScoreBar = function(input_df, output, show_label){
+  # Define colors
+  colors <- c("#3274a1", "#d2d2d2", "#e1812c")
+  
+  # Create a custom color scale
+  cmap <- colorRampPalette(colors)
+  
+  # Sort the data frame by score in descending order
+  input_df <- input_df[order(-input_df$score), ]
+  print(paste0(output, ": ", mean(input_df$score)))
+  
+  # Create the plot
+  p = ggplot(input_df, aes(x = reorder(name, -score), y = score, fill = score)) +
+    geom_bar(stat = "identity", color = NA, width = 0.5) +  # Remove border
+    scale_fill_gradientn(colors = cmap(n = nrow(input_df)), limits = range(input_df$score),
+                         breaks = pretty(range(input_df$score), n = 5)) +
+    scale_y_continuous(labels = scales::number_format()) +  # Format y-axis labels
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+    labs(title = output,
+         x = NULL, y = NULL) 
+  if (show_label){
+    p = p + theme(panel.grid = element_blank(), 
+              panel.background = element_rect(color = "black", fill = NA))
+  } else{
+    p = p + theme(panel.grid = element_blank(), 
+              panel.background = element_rect(color = "black", fill = NA),
+              axis.title.x=element_blank(),
+              axis.text.x=element_blank(),
+              axis.ticks.x=element_blank())
+  }
+  ggsave(file.path(plot_dir,bar_plt, paste0(output,".pdf")), p, limitsize = FALSE, width = 10, height = 2.25)
+  
+}
+
+```
+
+# 5b. Evaluating with bulk ATAC-seq data
+
+## Data source
+
+Same data set used in differential accessibility analysis
+
+```{r}
+score_df = read.table(file.path(bulk_res,"reninness_score.csv"), sep = ",", header = TRUE )
+
+```
+
+# 5c. Evaluating with scATAC-seq data
+
+## Data source
+
+1.  **Martini AG**, Smith JP, Medrano S, Finer G, Sheffield NC, Sequeira-Lopez MLS, Gomez RA. Renin Cell Development: Insights From Chromatin Accessibility and Single-Cell Transcriptomics. Circ Res. 2023 Aug 4;133(4):369-371. doi: 10.1161/CIRCRESAHA.123.322827. Epub 2023 Jul 3. PMID: 37395102; PMCID: PMC10529662.
+
+```{bash}
+
+# download data from  GEO: GSE218570
+wget -O GSE218570_raw.tar 'https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE218570&format=file'
+```
+
+## pseudo-bulk ATAC-seq data of pre-defined cell type clusters
+
+```         
+```
+
+## pseudo-bulk ATAC-seq data of single cell peak sets
+
+### Create bed files for each single cell by bercode
+
+```{r}
+# define file path
+files <- c(
+file.path(scATAC_dir, "GSM6752618_E12_fragments.tsv"),
+file.path(scATAC_dir, "GSM6752619_E18_fragments.tsv"),
+file.path(scATAC_dir, "GSM6752620_P5_fragments.tsv"),
+file.path(scATAC_dir, "GSM6752621_P30_fragments.tsv")
+)
+
+# Set names for the input files
+file_names <- c( "E12", "E18", "P5", "P30")
+names(files) <- file_names
+```
+
+```{r}
+# define function to creat bed files of region set for each single cell
+makeBedFile = function(file_name, output_dir){
+  file = files[file_name]
+  # Read the data
+  data = read.table(file, header = FALSE, skip = 52, sep = "\t", 
+                     col.names = c("chrom", "start", "end", "barcode", "clusterID"))
+  # Read cluster_barcodes table
+  barcodes = read.table(cluster_barcode, comment.char = "", header = TRUE, sep=",")
+  # Group by barcode, remove duplicates, and write separate BED files for each barcode
+  
+  # Filter data based on barcodes$cellID
+  data <- data %>%
+    filter(barcode %in% barcodes$cellID)
+
+  data %>%
+    group_by(barcode) %>%
+    distinct(chrom, start, end, .keep_all = TRUE) %>%
+    group_split() %>%
+    purrr::walk(~{
+      barcode <- .$barcode[1]
+      bed_data <- dplyr::select(., chrom, start, end)
+      write.table(bed_data, 
+                  file.path(output_dir, paste0(file_name,"_", barcode, ".bed")), 
+                  sep = "\t", col.names = FALSE, quote = FALSE, row.names = FALSE)
+    })
+}
+```
+
+```{r}
+# Use lapply to apply the function to each file of the scATAC-seq data
+lapply(file_names, function(file_name) makeBedFile(file_name, barcode_dir))
+```
+
+run bedtools intersect with `5_run_bedtools.sh` to get the called peaks for each files
+
+#### Plot reninness score
+
+```{r}
+# load result table
+score_df = read.table(file.path(paste0(sc_res,"_d3"),"reninness_score_mm10.csv"), sep = ",", header = TRUE )
+
+# define pos and neg labels based on results from scATAC-seq pre-defined cell type clusters
+renin_pos = c("late_JG","POD_PC_MC",  "early_MC", "early_JG", "late_MC", "late_SMC", "PC", "early_SMC", "renin_precursors")
+renin_neg = c("POD", "UC_CDPC_corticalSTR", "medullarySTR_FB", "medullarySTR", "UB_progenitors", "stromal_progenitor", "prolifEPI", "MM_progenitors", "stromal_progenitor_FB")
+
+score_ren_pos_df = subset(score_df, !(file_label %in% renin_neg))
+score_ren_neg_df = subset(score_df, !(file_label %in% renin_pos))
+```
+
+```{r}
+# plot cells in the pos cell types
+plotScoreBar(score_ren_pos_df,"sc_pos_d3", FALSE)
+```
+
+```{r}
+# plot cells in the neg cell types
+plotScoreBar(score_ren_neg_df,"sc_neg_d3", FALSE)
+```
+
+```{r}
+# plot each cell type separately
+types = unique(score_ren_pos_df$file_label[!score_ren_pos_df$file_label %in% c("Renin", "Non_Renin")])
+
+lapply(types, function(type) plotScoreBar(subset(score_ren_pos_df, !(file_label == type)), type, FALSE))
+```
+
+```{r}
+# plot each cell type separately
+types = unique(score_ren_neg_df$file_label[!score_ren_neg_df$file_label %in% c("Renin", "Non_Renin")])
+
+lapply(types, function(type) plotScoreBar(subset(score_ren_neg_df, !(file_label == type)), type, FALSE))
+```
+
+#### Plot significant difference in the mean score between pre-defined cell types
+
+```{r}
+# test and plot if the two group are significantly different in scores
+score_df$group <- ifelse(score_df$file_label %in% renin_neg, "Non_Renin", 
+                         ifelse(score_df$file_label %in% renin_pos, "Renin", NA))
+test_df <- score_df[complete.cases(score_df$group), ]
+# test_df = score_df[1:(nrow(score_df) - 2), ]
+
+# Run ANOVA test to check if means are significantly different
+anova_result <- aov(score ~ group, data = test_df)
+anova_summary <- summary(anova_result)
+
+# Print ANOVA summary
+print(anova_summary)
+
+# Plot means with significance markers
+plot <- ggplot(test_df, aes(reorder(group, -score), y = score, fill = group)) +
+  geom_violin(scale = "width", width = 0.5) +
+  geom_boxplot(width=0.1, fill = "white") +
+  # stat_summary(fun.data = mean_sdl, 
+  #              geom = "errorbar", 
+  #              position = position_dodge(width = 0.2), 
+  #              width = 0.1) +
+  geom_signif(comparisons = list(c("Renin", "Non_Renin")), # Define the comparisons
+              map_signif_level = TRUE, textsize = 5, color = "black") +     # Add "*" for significant differences
+  labs(x = "Group", y = "Value") + 
+  scale_fill_manual(values = c("Renin" = "#e1812c", "Non_Renin" = "#3274a1")) +  # Set colors for groups
+  ylim(-1,1) +
+  theme(panel.grid = element_blank(), 
+              panel.background = element_rect(color = "black", fill = NA))
+
+ggsave(file.path(plot_dir,bar_plt, paste0("score_sig_diff_r_nr_d3.pdf")), plot, limitsize = FALSE, width = 4, height = 4)
+
+# Print plot
+plot
+```
+
+```{r}
+# Run ANOVA test to check if means are significantly different
+anova_result <- aov(score ~ file_label, data = test_df)
+
+# Extract unique levels of the grouping variable
+groups <- unique(test_df$file_label)
+
+# Perform pairwise comparisons between groups
+pairwise_comp <- pairwise.t.test(test_df$score, test_df$file_label, p.adjust.method = "bonferroni")
+
+# Extract significant comparisons
+significant_pairs <- pairwise_comp$p.value < 0.01
+
+# Generate combinations of all possible pairs
+comparison_pairs <- combn(groups, 2, simplify = TRUE)
+
+# Convert pairs to a list
+comparison_pairs_list <- lapply(1:ncol(comparison_pairs), function(i) {
+  as.vector(comparison_pairs[, i])
+})
+
+# Filter pairs to contain only significant ones
+pairs <- comparison_pairs_list[significant_pairs]
+pairs <- unique(Filter(Negate(is.null), pairs))
+
+# Create the plot
+plot <- ggplot(test_df, aes(x = reorder(file_label, -score), y = score, fill = group)) +
+  geom_violin(scale = "width", width = 0.5) +
+  geom_boxplot(width=0.1, fill = "white") +
+  # stat_summary(fun.data = mean_sdl, 
+  #              geom = "errorbar", 
+  #              position = position_dodge(width = 0.2), 
+  #              width = 0.5) +
+  # geom_signif(comparisons = pairs,  # Use significant comparisons
+  #             map_signif_level = TRUE, textsize = 2, color = "black") +                # Add "*" for significant differences
+  labs(x = "Group", y = "Value") +
+  scale_fill_manual(values = c("Renin" = "#e1812c", "Non_Renin" = "#3274a1")) +  # Set colors for groups
+  ylim(-1,1) +
+  theme(panel.grid = element_blank(), 
+        panel.background = element_rect(color = "black", fill = NA),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) 
+
+ggsave(file.path(plot_dir,bar_plt, paste0("score_sig_diff_cell_types_d3.pdf")), plot, limitsize = FALSE, width = 8, height = 4)
+# Print plot
+plot
+```
