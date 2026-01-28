@@ -389,8 +389,9 @@ myDesign <- "Renin (primary kidney cell) vs Non-renin control"
 # set contract group
 Group <- list(samples$Group)[[1]]
 
-renin_samples <- sample_name[1:6] # for renin primary kidney vs encode
-# renin_samples <- sample_name[1:23] # for renin samples
+# renin_samples <- sample_name[1:13] # for renin primary kidney vs encode
+renin_samples <- sample_name[1:6] # for renin tumoral vs encode
+# renin_samples <- sample_name[1:19] # for all renin vs encode
 
 # counting features & normalizing counts
 output = countFeatures(bams.files, bamp.files, regionsToCount)
