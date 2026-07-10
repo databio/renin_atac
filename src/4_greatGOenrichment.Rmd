@@ -1,4 +1,4 @@
----
+# ---
 title: "4. GO Enrichment Analysis with rGREAT"
 author: "xue"
 date: "2024-02-27"
@@ -21,8 +21,8 @@ library(genomation)
 
 ## Set working directory
 
-```{r}
-wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/gitk_univ"
+```{r setup, include=FALSE}
+wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/geniml_univ_cc"
 knitr::opts_knit$set(root.dir = wd)
 ```
 
@@ -45,7 +45,7 @@ bed_paths = list(
 
 ```{r}
 output_plot = file.path("plot", "GO_enrichment")
-# dir.create(output_plot, showWarnings = FALSE)
+dir.create(output_plot, showWarnings = FALSE)
 ```
 
 ## Load input files
@@ -162,7 +162,7 @@ plotTopEnrichedGO = function(dfs, n = 20, output) {
 ```
 
 ```{r}
-plotTopEnrichedGO(differential_enrichment_results, n = 20, output = outputplot)
+plotTopEnrichedGO(differential_enrichment_results, n = 20, output = output_plot)
 ```
 
 # 4d. Calculate weighted rank of the renin related GO terms for Renin vs other regions
@@ -171,7 +171,7 @@ plotTopEnrichedGO(differential_enrichment_results, n = 20, output = outputplot)
 # define function
 
 filterEnrichment = function(df) {
-  go = subset(df, df$Hyper_Raw_PValue <= 0.001)
+  go = subset(df, df$Hyper_Adjp_BH <= 0.1 & Hyper_Foreground_Gene_Hits >= 3)
   rownames(go) = seq_len(nrow(go))
   return(go)
 }
@@ -233,7 +233,7 @@ getRankWeight = function(dfs, my_go_terms) {
 
   # First: compute rank_pvalue_weight and filter
   for (i in seq_along(dfs)) {
-    dfs[[i]]$rank_pvalue_weight = (total - dfs[[i]]$rank_pvalue)/total
+    dfs[[i]]$rank_pvalue_weight = (total - dfs[[i]]$rank_fold)/total
     dfs[[i]] = subset(dfs[[i]], name %in% my_go_terms)
   }
 
@@ -324,7 +324,9 @@ p <- data_new %>%
 
 ggsave(output_file,
        plot = p,
+       device = svglite::svglite,
        width = max(4, n_terms * 0.1),
        height = 7,
        units = "in")
+
 ```

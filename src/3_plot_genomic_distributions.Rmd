@@ -15,6 +15,8 @@ This document generates GenomicDictribution plots for region set of interest def
 library("genomation")
 library("GenomicDistributions")
 library("GenomicDistributionsData")
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(BSgenome.Mmusculus.UCSC.mm10.masked)
 library("UpSetR")
 library("gplots")
 library("tidyverse")
@@ -24,7 +26,8 @@ library(BioVenn)
 ## Set working directory
 
 ```{r, setup, include=FALSE}
-wd = "/project/shefflab/processed/gomez_atac/results_pipeline/differential/gitk_univ"
+wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/geniml_univ_cc"
+
 knitr::opts_knit$set(root.dir = wd)
 ```
 
@@ -46,8 +49,8 @@ th_file = "deseq/deseq_normal_tumoral_report_shrink.csv"
 ```{r}
 # output path for the bed files of region sets of interest
 bed_dir = "bed"
-
-# group by change in accessibility and sample groups 
+dir.create(file.path(bed_dir), recursive = TRUE, showWarnings = FALSE)
+# group by change in accessibility and sample groups
 # decreased accessibility regions in WT samples
 pn_down_bed = file.path(bed_dir, "deseq_wt_all_diff_down.bed")
 # increased accessibility regions in WT samples
@@ -59,24 +62,32 @@ ph_down_bed = file.path(bed_dir, "deseq_recruited_all_diff_down.bed")
 ph_up_bed = file.path(bed_dir, "deseq_recruited_all_diff_up.bed")
 
 # decreased accessibility regions in tumoral samples
-th_down_bed = file.path(bed_dir, "deseq_tumoral_all_diff_down.bed") 
+th_down_bed = file.path(bed_dir, "deseq_tumoral_all_diff_down.bed")
 # increased accessibility regions in tumoral samples
 th_up_bed = file.path(bed_dir, "deseq_tumoral_all_diff_up.bed")
 
+# union across all sample groups
+# all increased accessibility regions (union of WT, recruited, tumoral)
+all_up_bed = file.path(bed_dir, "deseq_all_diff_up.bed")
+# all decreased accessibility regions (union of WT, recruited, tumoral)
+all_down_bed = file.path(bed_dir, "deseq_all_diff_down.bed")
+# non-differential regions: tested in the universe but not differential in any group
+non_diff_bed = file.path(bed_dir, "deseq_non_diff.bed")
+
 # group by change in accessibility and regions shared among sample groups
-# decreased accessibility regions only in wt samples 
+# decreased accessibility regions only in wt samples
 pn_down_only_bed = file.path(bed_dir, "deseq_wt_only_diff_down.bed")
-# increased accessibility regions only in tumoral samples 
+# increased accessibility regions only in tumoral samples
 pn_up_only_bed = file.path(bed_dir, "deseq_wt_only_diff_up.bed")
 
-# decreased accessibility regions only in wt samples 
+# decreased accessibility regions only in wt samples
 ph_down_only_bed = file.path(bed_dir, "deseq_recruited_only_diff_down.bed")
-# increased accessibility regions only in tumoral samples 
+# increased accessibility regions only in tumoral samples
 ph_up_only_bed = file.path(bed_dir, "deseq_recruited_only_diff_up.bed")
 
-# decreased accessibility regions only in tumoral samples 
+# decreased accessibility regions only in tumoral samples
 th_down_only_bed = file.path(bed_dir, "deseq_tumoral_only_diff_down.bed")
-# increased accessibility regions only in tumoral samples 
+# increased accessibility regions only in tumoral samples
 th_up_only_bed = file.path(bed_dir, "deseq_tumoral_only_diff_up.bed")
 
 # decreased accessibility regions shared in wt and recruited
@@ -85,7 +96,7 @@ pn_ph_down_bed = file.path(bed_dir, "deseq_wt_recruited_diff_down.bed")
 pn_th_down_bed = file.path(bed_dir, "deseq_wt_tumoral_diff_down.bed")
 # decreased accessibility regions shared in recruited and tumoral
 ph_th_down_bed = file.path(bed_dir, "deseq_recruited_tumoral_diff_down.bed")
-# decreased accessibility regions shared in all three 
+# decreased accessibility regions shared in all three
 all_3_down_bed = file.path(bed_dir, "deseq_all_3_diff_down.bed")
 
 # increased accessibility regions shared in wt and recruited
@@ -94,7 +105,7 @@ pn_ph_up_bed = file.path(bed_dir, "deseq_wt_recruited_diff_up.bed")
 pn_th_up_bed = file.path(bed_dir, "deseq_wt_tumoral_diff_up.bed")
 # increased accessibility regions shared in recruited and tumoral
 ph_th_up_bed = file.path(bed_dir, "deseq_recruited_tumoral_diff_up.bed")
-# increased accessibility regions shared in all three 
+# increased accessibility regions shared in all three
 all_3_up_bed = file.path(bed_dir, "deseq_all_3_diff_up.bed")
 
 # Renin specific regions: increased accessibility regions shared in at lease two sample groups
@@ -123,7 +134,7 @@ tss = "TSS" # Region-TSS distance plot
 gp = "distOverPartitions" # Regions distribution over genomic partitions plot
 ep = "expDistOverPartitions" # Expected distribution over genomic partitions plot
 cp = "cumDistOverPartitions" # Cumulative distribution over genomic partitions plot
-cs = "cellSpecific_encode_mm10" # Cell specific enrichment for open chromatin plot
+cs = "cellSpecific" # Cell specific enrichment for open chromatin plot
 nd = "neighborDist" # Distance between neighbor regions
 gc = "GcContent" # GC content plot
 wh = "widthHist" # Quantile-trimmed histogram of widths
@@ -299,15 +310,18 @@ listInput = list(WT_up = pn_up$name,
                      tumoral_down = th_down$name
                  )
 
-upset_plot <- upset(fromList(listInput), 
-                    mainbar.y.label = "overlapped regions",
-                    sets = c("WT_up", "recruited_up", "tumoral_up", 
-                             "WT_down", "recruited_down", "tumoral_down"),
-                    keep.order = TRUE, order.by = "freq", 
-                    text.scale = c(1.5,1.5,1.5,1.5,1.75,1.5)
-                    )
-# ggsave(upset_path, ggplotify::as.ggplot(upset_plot))
-upset_plot
+svg(upset_path, width = 10, height = 6, onefile = FALSE)
+upset(fromList(listInput),
+      mainbar.y.label = "overlapped regions",
+      sets.x.label = "regions per group",
+      sets = c("WT_up", "recruited_up", "tumoral_up",
+               "WT_down", "recruited_down", "tumoral_down"),
+      keep.order = TRUE, order.by = "freq",
+      show.numbers = "yes",
+      set_size.show = TRUE,
+      set_size.scale_max = max(lengths(listInput)) * 1.2,
+      text.scale = c(1.5,1.5,1.5,1.5,1.75,1.5))
+dev.off()
 ```
 
 ## Create bed files for each of the vertical region set in the upset plot
@@ -420,12 +434,48 @@ for (i in 1:length(set_list)) {
   
 ```
 
+## Create union and non-differential region sets
+
+```{r}
+# all increased accessibility regions across all three sample groups (union)
+all_up_names = unique(c(pn_up$name, ph_up$name, th_up$name))
+
+# all decreased accessibility regions across all three sample groups (union)
+all_down_names = unique(c(pn_down$name, ph_down$name, th_down$name))
+
+# all regions tested in the universe (union across the three DESeq2 reports)
+universeNames = function(gr) {
+  df = as.data.frame(gr)
+  paste(df$seqnames, df$start, df$end, sep = "_")
+}
+all_region_names = unique(c(universeNames(pn), universeNames(ph), universeNames(th)))
+
+# non-differential regions: in the universe but not differential in any group
+non_diff_names = setdiff(all_region_names, c(all_up_names, all_down_names))
+
+# save as bed files and keep GRanges for downstream use
+all_up_gr = listToGrange(all_up_names, all_up_bed)
+all_down_gr = listToGrange(all_down_names, all_down_bed)
+non_diff_gr = listToGrange(non_diff_names, non_diff_bed)
+```
+
 # 3c. Visualizing with GenomicDistributions
 
 ```{r}
 # define function to:
 # 1: plot all GD plots
 # 2: save all plots
+
+cs_plot_type = "violinPlot"
+# cs_plot_type = "barPlot"
+
+# background = "default"
+# openSignalMatrix_mm10 = openSignalMatrix_mm10()
+
+background = "encode"
+openSignalMatrix_mm10 = read.table("encode_mm10_meanCoverage_percentile99_01_quantNormalized_round4d.txt", header=TRUE)
+
+
 
 plotAllGD = function(gr, output){
   # Arguments:
@@ -444,15 +494,15 @@ plotAllGD = function(gr, output){
                   "chrY")
         x = x[x$chr %in% chrom,]
         savePlots(dc, output, plotChromBins(x))
-        
+
         message("Successfully calculated and plot chromosomes region distribution.")
       },
       error = function(e){
         message('Caught an error!')
         print(e)
       }
-    ) 
-  
+    )
+
   # Region-TSS distance plot
   tryCatch(
       expr = {
@@ -464,8 +514,8 @@ plotAllGD = function(gr, output){
         message('Caught an error!')
         print(e)
       }
-    ) 
-  
+    )
+
   # Regions distribution over genomic partitions plot
   tryCatch(
     expr = {
@@ -477,7 +527,7 @@ plotAllGD = function(gr, output){
       message('Caught an error!')
       print(e)
     }
-  ) 
+  )
 
   # Expected distribution over genomic partitions plot
   tryCatch(
@@ -504,25 +554,22 @@ plotAllGD = function(gr, output){
       print(e)
     }
   )
-  
+
   # Cell specific enrichment for open chromatin plot
   tryCatch(
       expr = {
-        openSignalMatrix_mm10 = read.table("encode_mm10_meanCoverage_percentile99_01_quantNormalized_round4d.txt", header=TRUE)
         op = calcSummarySignal(gr, openSignalMatrix_mm10)
-        # get cell type metadata from GenomicDistributions
-        cellTypeMetadata = cellTypeMetadata
-        p = plotSummarySignal(op, metadata = cellTypeMetadata, plotType = "violinPlot")+
+        p = plotSummarySignal(op, plotType = cs_plot_type)+
           ylim(0, 1)
-        savePlots(cs, output, p)
+        savePlots(paste(cs, background, cs_plot_type, sep = "_"), output, p)
         message("Successfully calculated and plot cell specific enrichment for open chromatin.")
         },
       error = function(e){
         message('Caught an error!')
         print(e)
       }
-    ) 
-  
+    )
+
   # Distance between neighbor regions
   tryCatch(
     expr = {
@@ -535,7 +582,7 @@ plotAllGD = function(gr, output){
       print(e)
     }
   )
-  
+
   # GC content plot
   tryCatch(
     expr = {
@@ -548,7 +595,7 @@ plotAllGD = function(gr, output){
       print(e)
     }
   )
-   
+
   # Quantile-trimmed histogram of widths
   tryCatch(
     expr = {

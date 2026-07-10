@@ -13,12 +13,14 @@ output: html_document
 library(genomation)
 library(GenomicFeatures)
 library (BSgenome.Mmusculus.UCSC.mm10)
+library(ggplot2)
+library(patchwork)
 ```
 
 ## Set working directory
 
 ```{r, setup, include=FALSE}
-wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/gitk_univ"
+wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/geniml_univ_cc"
 knitr::opts_knit$set(root.dir = wd)
 ```
 
@@ -34,7 +36,7 @@ bg_bed = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeli
 bed_dir = "bed"
 
 # motif enrichment result
-meme_dir =  "meme"
+meme_dir =  "meme_res"
 ```
 
 ### Set output directory
@@ -60,7 +62,7 @@ chroms = c("chr1", "chr2","chr3","chr4","chr5",
 getFasta = function(input_bed){
   # Modify the file name to change the extension
   name_bed = basename(input_bed)
-  name_fa = sub("\\.bed$", ".fa", name_bed)  
+  name_fa <- sub("\\.(bed|narrowPeak)$", ".fa", name_bed) 
   
   # Construct the output file path
   if (!dir.exists(fa_dir)) {
@@ -115,7 +117,7 @@ lapply(region_sets, getFasta)
 
 ```{bash}
 
-bash 5_motif_enrichment.sh
+bash 6_motif_enrichment.sh
 ```
 
 # 4d. Plot enriched motifs
@@ -129,7 +131,7 @@ plotMotifEnrichment = function(set){
       # load data
       df = read.csv(input, sep="\t", check.names = FALSE)
       df = df[1:(nrow(df) - 3), ]
-      df$ID = sub("_.*", "", df$ID)
+      df$ID = sub("\\..*", "", df$ID)
       df$ID = factor(df$ID, levels = unique(df$ID))
       df = df[!duplicated(df$ID), ]
        
@@ -142,7 +144,7 @@ plotMotifEnrichment = function(set){
       df$`-LOG_PVALUE` = -df$LOG_PVALUE
       df$`-LOG_PVALUE` = as.numeric(as.character(df$`-LOG_PVALUE`))
       df$`TP%` = as.numeric(as.character(df$`TP%`))
-
+      # print(df)
       # plot the data
       scaleFactor <- max(df$`-LOG_PVALUE`) / 100
       # Create plot
@@ -190,10 +192,10 @@ plotMotifEnrichment = function(set){
       
       ggsave(output, p, width = 3.5, height = 2.25)
     },
-    error = function(e){
-      message('Caught an error!')
-      print(e)
-    }
+  error = function(e){
+    message(paste('Caught an error for set:', set))
+    print(e)
+  }
   )
 }
 ```
@@ -205,4 +207,92 @@ motif_sets = list.files(file.path(meme_dir))
 # Use lapply to apply the function to each file in motif_sets
 lapply(motif_sets, plotMotifEnrichment)
 
+```
+
+# 4e. JG cell scRNA-seq expression of enriched-motif TFs
+
+## Load JG cell scRNA-seq data
+
+```{r}
+# paths relative to src/
+meta_dir <- "~/code/renin_atac/metadata"
+
+# score matrix: one row per gene, one column per JG cell
+df_score <- read.csv(file.path(meta_dir, "GIM_JG-cells_matrix.csv"),
+                     check.names = FALSE)
+
+# row data: gene annotation, row-parallel to df_score
+df_gene <- read.csv(file.path(meta_dir, "GIM_JG-cells_row-data.csv"))
+```
+
+## Average expression per gene across all JG cells
+
+```{r}
+df_gene$average <- rowMeans(as.matrix(df_score))
+```
+
+## Define motif classes
+
+```{r}
+# HOCOMOCO motif names (motif) mapped to the mm10 gene symbols (gene)
+# used in the scRNA-seq row data
+motif_classes <- data.frame(
+  class = c(rep("MADS box", 5), rep("RHR", 3), rep("Homeo", 6),
+            rep("C4 zinc fingers", 8), rep("bZIP", 18)),
+  motif = c("MEF2A", "MEF2B", "MEF2C", "MEF2D", "SRF",
+            "COE1", "COE2", "COE3",
+            "HXC10", "HXA9", "HXC9", "HXB7", "MEIS1", "MEIS2",
+            "RXRA", "COT1", "RARG", "NR2F6", "RARA", "NR4A2", "RARB", "SATB1",
+            "JUNB", "JUND", "FOSL1", "FOSL2", "FOS", "FOSB", "JUN", "CREB1",
+            "ATF3", "BATF", "BATF2", "BACH2", "NFIL3", "NFE2", "NF2L1",
+            "NF2L2", "MAFG", "MAFB"),
+  gene = c("Mef2a", "Mef2b", "Mef2c", "Mef2d", "Srf",
+           "Ebf1", "Ebf2", "Ebf3",
+           "Hoxc10", "Hoxa9", "Hoxc9", "Hoxb7", "Meis1", "Meis2",
+           "Rxra", "Nr2f1", "Rarg", "Nr2f6", "Rara", "Nr4a2", "Rarb", "Satb1",
+           "Junb", "Jund", "Fosl1", "Fosl2", "Fos", "Fosb", "Jun", "Creb1",
+           "Atf3", "Batf", "Batf2", "Bach2", "Nfil3", "Nfe2", "Nfe2l1",
+           "Nfe2l2", "Mafg", "Mafb"),
+  stringsAsFactors = FALSE
+)
+```
+
+## Grouped bar plot of TF expression by motif class
+
+```{r}
+plot_df <- merge(motif_classes, df_gene[, c("name", "average")],
+                 by.x = "gene", by.y = "name", all.x = TRUE)
+
+class_levels <- c("MADS box", "RHR", "Homeo", "C4 zinc fingers", "bZIP")
+plot_df$class <- factor(plot_df$class, levels = class_levels)
+
+# one fixed colour per class
+class_colors <- setNames(scales::hue_pal()(length(class_levels)), class_levels)
+
+# build one bar plot per class, bars sorted high -> low
+make_class_plot <- function(cls) {
+  d <- plot_df[plot_df$class == cls, ]
+  d <- d[order(-d$average), ]
+  d$motif <- factor(d$motif, levels = d$motif)
+  ylab <- if (cls == class_levels[1]) "Average expression score (JG cells)" else NULL
+  ggplot(d, aes(x = motif, y = average)) +
+    geom_bar(stat = "identity", width = 0.8, fill = class_colors[cls]) +
+    labs(x = NULL, y = ylab, title = cls) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1,
+                                     size = 8, color = "black"),
+          plot.title = element_text(size = 9, hjust = 0.5),
+          panel.grid = element_blank())
+}
+
+plots <- lapply(class_levels, make_class_plot)
+
+# panel widths proportional to bar count -> uniform bar width across classes
+bar_counts <- as.integer(table(plot_df$class)[class_levels])
+p <- patchwork::wrap_plots(plots, nrow = 1, widths = bar_counts)
+
+if (!dir.exists(plot_dir)) dir.create(plot_dir, recursive = TRUE)
+ggsave(file.path(plot_dir, "tf_expression_by_motif_class.pdf"),
+       p, width = 11, height = 3.5)
+p
 ```
