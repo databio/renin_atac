@@ -20,7 +20,7 @@ library(patchwork)
 ## Set working directory
 
 ```{r, setup, include=FALSE}
-wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/geniml_univ_cc"
+wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/geniml_univ_cc_073126"
 knitr::opts_knit$set(root.dir = wd)
 ```
 
@@ -29,8 +29,8 @@ knitr::opts_knit$set(root.dir = wd)
 ### Set input directory
 
 ```{r}
-# non-renin consensus peaks
-bg_bed = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline_PEPATAC/encode_ATAC/summary/ENCODE_ATAC_mm10_consensusPeaks.narrowPeak"
+# universe
+univ_bed = "/home/bx2ur/code/reninness_score/data/universe_073126/universe_cc_073126.bed"
 
 # region set dir 
 bed_dir = "bed"
@@ -96,9 +96,62 @@ getFasta = function(input_bed){
 }
 ```
 
-## Generate fasta file for consensus peaks of non-renin background
+## Generate fasta file for the background
+
+The background for the increased-accessibility sets is the universe with every
+increased-accessibility region removed.
+
+Why this one rather than the universe itself, or a per-subset background:
+
+- SEA compares `--p` against `--n` with a Fisher test on a 2x2 table, which needs
+  the two sets to be **disjoint**. Every region set here is a strict subset of the
+  universe, so using the raw universe would put the foreground inside its own
+  background and shrink the measured effect by the subset's share of the universe.
+  Negligible for the small sets, fatal for large ones.
+- The union of all `*_diff_up` sets is exactly `deseq_all_diff_up`, so removing
+  them all leaves a background disjoint from *every* increased set at once. One
+  shared background keeps the FP% denominator identical across runs, so TP%/FP%
+  and E-values stay comparable between renin types. A per-subset background would
+  break that comparability, and would still leave the other, heavily overlapping
+  increased sets in the background diluting the shared renin signal.
+- `renin_specific_regions` sits entirely inside `deseq_all_diff_up`, so it is
+  covered by the same removal.
+
+Naming: the output lands in `fa_dir` as `universe_minus_diff_up.fa`. The
+`universe_*` prefix matters -- `6_motif_enrichment.sh` excludes that pattern from
+its `*.fa` glob, so the background is not picked up and scored as a region set.
 
 ```{r}
+bg_dir = "background"
+if (!dir.exists(bg_dir)) dir.create(bg_dir, recursive = TRUE)
+bg_bed = file.path(bg_dir, "universe_minus_diff_up.bed")
+
+# exact-coordinate key; the increased sets are drawn from the universe, so whole
+# regions are dropped. An interval subtraction (setdiff) would instead trim and
+# split universe regions, changing their length distribution.
+bedKey = function(d) paste(d$chr, d$start, d$end, sep = "_")
+
+readBed3 = function(f) {
+  d = read.table(f, header = FALSE, sep = "\t")[, 1:3]
+  colnames(d) = c("chr", "start", "end")
+  d
+}
+
+univ = readBed3(univ_bed)
+
+# every increased-accessibility region set
+up_beds = list.files(bed_dir, pattern = "_diff_up\\.bed$", full.names = TRUE)
+up = do.call(rbind, lapply(up_beds, readBed3))
+
+bg = univ[!(bedKey(univ) %in% bedKey(up)), ]
+
+# must hold, or the Fisher test above is invalid
+stopifnot(!any(bedKey(bg) %in% bedKey(up)))
+message(sprintf("background: %d universe - %d increased = %d regions (from %d up sets)",
+                nrow(univ), length(unique(bedKey(up))), nrow(bg), length(up_beds)))
+
+write.table(bg, bg_bed, sep = "\t", quote = FALSE,
+            row.names = FALSE, col.names = FALSE)
 getFasta(bg_bed)
 ```
 
@@ -235,26 +288,46 @@ df_gene$average <- rowMeans(as.matrix(df_score))
 
 ```{r}
 # HOCOMOCO motif names (motif) mapped to the mm10 gene symbols (gene)
-# used in the scRNA-seq row data
+# used in the scRNA-seq row data.
+#
+# Membership is the union of the top 20 SEA hits (by E-value) from the four
+# increased-accessibility sets of run 18495723 -- renin_specific_regions,
+# deseq_wt_all_diff_up, deseq_tumoral_all_diff_up, deseq_recruited_all_diff_up
+# -- deduplicated across sets and across H14CORE variants of the same TF
+# (e.g. BATF3.H14CORE.0/.1 collapse to one BATF3). 49 motifs.
+#
+# Classes follow TFClass. Four are small because the top-20 union pulled in
+# single non-canonical factors; collapse them into one "Other" level if the
+# one-bar panels are not wanted in the plot below.
 motif_classes <- data.frame(
-  class = c(rep("MADS box", 5), rep("RHR", 3), rep("Homeo", 6),
-            rep("C4 zinc fingers", 8), rep("bZIP", 18)),
+  class = c(rep("MADS box", 5), rep("RHR", 3), rep("Homeo", 5),
+            rep("C4 zinc fingers", 12), rep("bZIP", 19),
+            rep("C2H2 zinc fingers", 2), "STAT", "SAND", "AT-hook"),
   motif = c("MEF2A", "MEF2B", "MEF2C", "MEF2D", "SRF",
             "COE1", "COE2", "COE3",
-            "HXC10", "HXA9", "HXC9", "HXB7", "MEIS1", "MEIS2",
-            "RXRA", "COT1", "RARG", "NR2F6", "RARA", "NR4A2", "RARB", "SATB1",
-            "JUNB", "JUND", "FOSL1", "FOSL2", "FOS", "FOSB", "JUN", "CREB1",
-            "ATF3", "BATF", "BATF2", "BACH2", "NFIL3", "NFE2", "NF2L1",
-            "NF2L2", "MAFG", "MAFB"),
+            "HXA9", "HXC9", "HXC10", "MEIS1", "MEIS2",
+            "RXRA", "COT1", "COT2", "NR2F6", "NR2C1", "RARA", "RARB", "RARG",
+            "THB", "NR4A1", "ESR1", "ESR2",
+            "JUN", "JUNB", "JUND", "FOS", "FOSB", "FOSL1", "FOSL2", "ATF3",
+            "ATF6A", "ATF6B", "BATF", "BATF2", "BATF3", "BACH1", "BACH2",
+            "NFE2", "NF2L2", "CREB1", "CREM",
+            "PRD16", "SALL3",
+            "STA5A", "GMEB1", "ELYS"),
   gene = c("Mef2a", "Mef2b", "Mef2c", "Mef2d", "Srf",
            "Ebf1", "Ebf2", "Ebf3",
-           "Hoxc10", "Hoxa9", "Hoxc9", "Hoxb7", "Meis1", "Meis2",
-           "Rxra", "Nr2f1", "Rarg", "Nr2f6", "Rara", "Nr4a2", "Rarb", "Satb1",
-           "Junb", "Jund", "Fosl1", "Fosl2", "Fos", "Fosb", "Jun", "Creb1",
-           "Atf3", "Batf", "Batf2", "Bach2", "Nfil3", "Nfe2", "Nfe2l1",
-           "Nfe2l2", "Mafg", "Mafb"),
+           "Hoxa9", "Hoxc9", "Hoxc10", "Meis1", "Meis2",
+           "Rxra", "Nr2f1", "Nr2f2", "Nr2f6", "Nr2c1", "Rara", "Rarb", "Rarg",
+           "Thrb", "Nr4a1", "Esr1", "Esr2",
+           "Jun", "Junb", "Jund", "Fos", "Fosb", "Fosl1", "Fosl2", "Atf3",
+           "Atf6", "Atf6b", "Batf", "Batf2", "Batf3", "Bach1", "Bach2",
+           "Nfe2", "Nfe2l2", "Creb1", "Crem",
+           "Prdm16", "Sall3",
+           "Stat5a", "Gmeb1", "Ahctf1"),
   stringsAsFactors = FALSE
 )
+
+stopifnot(nrow(motif_classes) == 49,
+          !anyDuplicated(motif_classes$motif))
 ```
 
 ## Grouped bar plot of TF expression by motif class
@@ -263,7 +336,8 @@ motif_classes <- data.frame(
 plot_df <- merge(motif_classes, df_gene[, c("name", "average")],
                  by.x = "gene", by.y = "name", all.x = TRUE)
 
-class_levels <- c("MADS box", "RHR", "Homeo", "C4 zinc fingers", "bZIP")
+class_levels <- c("MADS box", "RHR", "Homeo", "C4 zinc fingers", "bZIP",
+                  "C2H2 zinc fingers", "STAT", "SAND", "AT-hook")
 plot_df$class <- factor(plot_df$class, levels = class_levels)
 
 # one fixed colour per class
@@ -294,5 +368,5 @@ p <- patchwork::wrap_plots(plots, nrow = 1, widths = bar_counts)
 if (!dir.exists(plot_dir)) dir.create(plot_dir, recursive = TRUE)
 ggsave(file.path(plot_dir, "tf_expression_by_motif_class.pdf"),
        p, width = 11, height = 3.5)
-p
+
 ```

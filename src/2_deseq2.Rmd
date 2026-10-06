@@ -31,7 +31,7 @@ library(ggrastr)
 ## Set working directory
 
 ```{r, setup, include=FALSE}
-wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/geniml_univ_cc"
+wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/geniml_univ_cc_073126"
 knitr::opts_knit$set(root.dir = wd)
 ```
 
@@ -62,8 +62,8 @@ recruited_report_shrink = "deseq/recruited_report_shrink.csv"
 ## Load input files
 
 ```{r}
-# load("renin_encode_atac_primary.RData")
-load("renin_encode_atac_tumoral.RData")
+load("renin_encode_atac_primary.RData")
+# load("renin_encode_atac_tumoral.RData")
      
 # meta data
 samples <- read.table(meta, header=TRUE, sep = ",")
@@ -107,16 +107,16 @@ save.image("renin_encode_atac_tumoral.RData")
 
 # for renin vs non-renin
 # primary renin
-# res_ren_normal_p <- results(dds, 
-#                             c(contrast, "Renin_Normal", "Non-Renin_Control"), 
-#                             format = "GRanges")
-# res_ren_high_p <- results(dds, 
-#                           c(contrast, "Renin_High", "Non-Renin_Control"), 
-#                           format = "GRanges")
-# tumoral renin
-res_ren_normal_t <- results(dds,
+res_ren_normal_p <- results(dds,
                             c(contrast, "Renin_Normal", "Non-Renin_Control"),
                             format = "GRanges")
+res_ren_high_p <- results(dds,
+                          c(contrast, "Renin_High", "Non-Renin_Control"),
+                          format = "GRanges")
+# tumoral renin
+# res_ren_normal_t <- results(dds,
+#                             c(contrast, "Renin_Normal", "Non-Renin_Control"),
+#                             format = "GRanges")
 
 # for WT renin vs recruited renin 
 # res_recruited <- results(dds, c(contrast, "Recruited", "Native"), 
@@ -126,19 +126,19 @@ res_ren_normal_t <- results(dds,
 ```{r}
 # shrink log2FoldChange
 # primary vs control
-# resLFC_n_p <- lfcShrink(dds, 
-#                       contrast = c(contrast, "Renin_Normal", "Non-Renin_Control"), 
-#                       type="ashr", 
-#                       format = "GRanges")
-# resLFC_h_p <- lfcShrink(dds, 
-#                       contrast = c(contrast, "Renin_High", "Non-Renin_Control"), 
-                      # type="ashr", 
-                      # format = "GRanges")
-# tumoral vs control
-resLFC_n_t <- lfcShrink(dds,
+resLFC_n_p <- lfcShrink(dds,
                       contrast = c(contrast, "Renin_Normal", "Non-Renin_Control"),
                       type="ashr",
                       format = "GRanges")
+resLFC_h_p <- lfcShrink(dds,
+                      contrast = c(contrast, "Renin_High", "Non-Renin_Control"),
+                      type="ashr",
+                      format = "GRanges")
+# tumoral vs control
+# resLFC_n_t <- lfcShrink(dds,
+#                       contrast = c(contrast, "Renin_Normal", "Non-Renin_Control"),
+#                       type="ashr",
+#                       format = "GRanges")
 
 # for WT renin vs recruited renin
 # resLFC_recruited <- lfcShrink(dds, 
@@ -168,38 +168,38 @@ write.table( x = data.frame(res_ren_high_p),
              quote=FALSE )
 
 # renin_tumoral vs ENCODE
-write.table( x = data.frame(res_ren_normal_t),
-             file = renin_normal_t_report,
-             sep=",",
-             col.names=TRUE,
-             row.names=FALSE,
-             quote=FALSE )
+# write.table( x = data.frame(res_ren_normal_t),
+#              file = renin_normal_t_report,
+#              sep=",",
+#              col.names=TRUE,
+#              row.names=FALSE,
+#              quote=FALSE )
 
 # combine shrunk log2FoldChange across contrasts and average
-combined_lfc <- data.frame(
-  seqnames = as.character(seqnames(resLFC_n_p)),
-  start = start(resLFC_n_p),
-  end = end(resLFC_n_p),
-  lfc_normal_primary = resLFC_n_p$log2FoldChange,
-  lfc_high_primary = resLFC_h_p$log2FoldChange,
-  lfc_normal_tumoral = resLFC_n_t$log2FoldChange
-)
-combined_lfc$log2FoldChange <- rowMeans(combined_lfc[, c("lfc_normal_primary", "lfc_high_primary", "lfc_normal_tumoral")])
+# combined_lfc <- data.frame(
+#   seqnames = as.character(seqnames(resLFC_n_p)),
+#   start = start(resLFC_n_p),
+#   end = end(resLFC_n_p),
+#   lfc_normal_primary = resLFC_n_p$log2FoldChange,
+#   lfc_high_primary = resLFC_h_p$log2FoldChange,
+#   lfc_normal_tumoral = resLFC_n_t$log2FoldChange
+# )
+# combined_lfc$log2FoldChange <- rowMeans(combined_lfc[, c("lfc_normal_primary", "lfc_high_primary", "lfc_normal_tumoral")])
 
-write.table(x = combined_lfc[, c("seqnames", "start", "end", "log2FoldChange")],
-            file = "deseq/combined_deseq_log2fc.csv",
-            sep = ",",
-            col.names = TRUE,
-            row.names = FALSE,
-            quote = FALSE)
+# write.table(x = combined_lfc[, c("seqnames", "start", "end", "log2FoldChange")],
+#             file = "deseq/combined_deseq_log2fc.csv",
+#             sep = ",",
+#             col.names = TRUE,
+#             row.names = FALSE,
+#             quote = FALSE)
 
 # for WT renin vs. recruited renin
-write.table( x = data.frame(res_recruited),
-             file = recruited_report,
-             sep=",",
-             col.names=TRUE,
-             row.names=FALSE,
-             quote=FALSE )
+# write.table( x = data.frame(res_recruited),
+#              file = recruited_report,
+#              sep=",",
+#              col.names=TRUE,
+#              row.names=FALSE,
+#              quote=FALSE )
 
 # shrink log2FoldChange report 
 # renin_primary_WT vs ENCODE
@@ -219,22 +219,22 @@ write.table( x = data.frame(resLFC_h_p),
              quote=FALSE )
 
 # renin_tumoral vs ENCODE
-write.table( x = data.frame(resLFC_n_t),
-             file = renin_normal_t_report_shrink,
-             sep=",",
-             col.names=TRUE,
-             row.names=FALSE,
-             quote=FALSE )
+# write.table( x = data.frame(resLFC_n_t),
+#              file = renin_normal_t_report_shrink,
+#              sep=",",
+#              col.names=TRUE,
+#              row.names=FALSE,
+#              quote=FALSE )
 
 # for WT renin vs. recruited renin
-write.table( x = data.frame(resLFC_recruited),
-             file = recruited_report_shrink,
-             sep=",",
-             col.names=TRUE,
-             row.names=FALSE,
-             quote=FALSE )
+# write.table( x = data.frame(resLFC_recruited),
+#              file = recruited_report_shrink,
+#              sep=",",
+#              col.names=TRUE,
+#              row.names=FALSE,
+#              quote=FALSE )
 
-# save.image("renin_encode_atac_primary.RData")
+save.image("renin_encode_atac_primary.RData")
 # save.image("renin_encode_atac_tumoral.RData")
 ```
 
@@ -530,8 +530,10 @@ res_ren_high = mutDF(resLFC_h_p, absFoldChange, fdr)
 res_ren_t = mutDF(resLFC_n_t, absFoldChange, fdr)
 
 # MA
+myDesign <- "Renin (primary kidney cell) vs Non-renin control"
 plotDESeqMA(res_ren_normal, "Normal", myDesign, output_dir)
 plotDESeqMA(res_ren_high, "High", myDesign, output_dir)
+myDesign <- "Renin (As4.1 cell line) vs Non-renin control"
 plotDESeqMA(res_ren_t, "High", myDesign, output_dir)
 
 # PCA
@@ -549,8 +551,10 @@ res_ren_normal <- annotateWithGenes(res_ren_normal, wt_up_gene)
 res_ren_high   <- annotateWithGenes(res_ren_high,   rc_up_gene)
 res_ren_t      <- annotateWithGenes(res_ren_t,      as_up_gene)
 
+myDesign <- "Renin (primary kidney cell) vs Non-renin control"
 plotVolcano (res_ren_normal, "Normal", myDesign, output_dir)
 plotVolcano (res_ren_high, "High", myDesign, output_dir)
+myDesign <- "Renin (As4.1 cell line) vs Non-renin control"
 plotVolcano (res_ren_t, "High", myDesign, output_dir)
 ```
 
@@ -564,6 +568,7 @@ pheatmap(test, fontsize=8, fontsize_col = 4, annotation_col=df,
          (length(seq(-6, 6, by = 1))), 
          breaks = seq(-6, 6, by = 1))
 # heatmap
+
 plotClusteredHeatmap(res_ren_normal, vsd, "Normal", myDesign,
                      contrast, absFoldChange, n)
 plotClusteredHeatmap(res_ren_high, vsd, "High", myDesign,

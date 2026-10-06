@@ -23,7 +23,7 @@ library(GenomicRanges)
 ## Set working directory
 
 ```{r setup, include=FALSE}
-wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/geniml_univ_cc"
+wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/geniml_univ_cc_073126"
 knitr::opts_knit$set(root.dir = wd)
 ```
 
@@ -37,7 +37,7 @@ dbPath = "/project/shefflab/LOLAweb/databases/LOLACore/mm10"
 # input bed file fir
 bed_dir = "bed"
 # Universe file
-univ_bed = "/home/bx2ur/code/reninness_score/data/universe/universe_cc.bed"
+univ_bed = "/home/bx2ur/code/reninness_score/data/universe_073126/universe_cc_073126.bed"
 
 # renin related differentially accessibile regions
 bed_paths = list(

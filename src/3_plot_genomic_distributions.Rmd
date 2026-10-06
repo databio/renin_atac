@@ -26,7 +26,7 @@ library(BioVenn)
 ## Set working directory
 
 ```{r, setup, include=FALSE}
-wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/geniml_univ_cc"
+wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/geniml_univ_cc_073126"
 
 knitr::opts_knit$set(root.dir = wd)
 ```
@@ -466,14 +466,35 @@ non_diff_gr = listToGrange(non_diff_names, non_diff_bed)
 # 1: plot all GD plots
 # 2: save all plots
 
-cs_plot_type = "violinPlot"
-# cs_plot_type = "barPlot"
+# cs_plot_type = "violinPlot"
+cs_plot_type = "barPlot"
+
+# Which open-chromatin reference the cell-specificity plot is scored against.
+# `background` only labels the output file, so the two options write to
+# different SVGs and neither overwrites the other.
+#
+# "default" = the 3-cell-type mm10 matrix shipped in GenomicDistributionsData.
+# "encode"  = our own 36-cell-type matrix: 26 ENCODE tissues (encode_ATAC) plus
+#             the 10 ctrl_tumoral_ATAC cell lines, built on the
+#             universe_cc_073126 grid (422,490 regions) by
+#             /scratch/bx2ur/openSignalMatrix_073126/{1_coverage_array.sbatch,2_build_matrix.R}.
+#             Only this one contains the tumoral cell lines.
+#
+# NOTE: read with fread(), not read.table(). read.table() applies make.names()
+# to the header, which would rename `4T1` -> `X4T1` and
+# `megakaryocyte-erythroid_progenitor_cell` -> `megakaryocyte.erythroid...`,
+# changing the labels on the plot. fread() keeps them verbatim (and is far
+# faster on a 114 MB file).
 
 # background = "default"
 # openSignalMatrix_mm10 = openSignalMatrix_mm10()
 
 background = "encode"
-openSignalMatrix_mm10 = read.table("encode_mm10_meanCoverage_percentile99_01_quantNormalized_round4d.txt", header=TRUE)
+openSignalMatrix_mm10 = data.table::fread(file.path(
+  "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline",
+  "differential/geniml_univ_cc_073126",
+  "encode_tumoral_mm10_meanCoverage_percentile99_01_quantNormalized_round4d.txt"))
+stopifnot(ncol(openSignalMatrix_mm10) == 37L, names(openSignalMatrix_mm10)[1] == "V1")
 
 
 
@@ -483,77 +504,77 @@ plotAllGD = function(gr, output){
   # output: output path.
   
   # Regions distribution over chromosomes plot
-   tryCatch(
-      expr = {
-        # First, calculate the distribution:
-        x = calcChromBinsRef(gr, "mm10")
-        chrom = c("chr1", "chr2","chr3","chr4","chr5",
-                  "chr6","chr7","chr8", "chr9", "chr10",
-                  "chr11","chr12","chr13","chr14","chr15",
-                  "chr16","chr17","chr18","chr19","chrX",
-                  "chrY")
-        x = x[x$chr %in% chrom,]
-        savePlots(dc, output, plotChromBins(x))
-
-        message("Successfully calculated and plot chromosomes region distribution.")
-      },
-      error = function(e){
-        message('Caught an error!')
-        print(e)
-      }
-    )
-
-  # Region-TSS distance plot
-  tryCatch(
-      expr = {
-       TSSdist = calcFeatureDistRefTSS(gr, "mm10")
-       savePlots(tss, output, plotFeatureDist(TSSdist, featureName="TSS"))
-       message("Successfully calculated and plot TSS distance.")
-      },
-      error = function(e){
-        message('Caught an error!')
-        print(e)
-      }
-    )
-
-  # Regions distribution over genomic partitions plot
-  tryCatch(
-    expr = {
-     gp1 = calcPartitionsRef(gr, "mm10")
-     savePlots(gp, output, plotPartitions(gp1))
-     message("Successfully calculated and plot regions distribution over genomic partitions.")
-    },
-    error = function(e){
-      message('Caught an error!')
-      print(e)
-    }
-  )
-
-  # Expected distribution over genomic partitions plot
-  tryCatch(
-    expr = {
-     ep1 = calcExpectedPartitionsRef(gr, "mm10")
-     savePlots(ep, output, plotExpectedPartitions(ep1))
-     message("Successfully calculated and plot expected distribution over genomic partitions.")
-    },
-    error = function(e){
-      message('Caught an error!')
-      print(e)
-    }
-  )
-
-  # Cumulative distribution over genomic partitions plot
-  tryCatch(
-    expr = {
-     cp1 = calcCumulativePartitionsRef(gr, "mm10")
-     savePlots(cp, output, plotCumulativePartitions(cp1))
-     message("Successfully calculated and plot cumulative distribution over genomic partitions.")
-    },
-    error = function(e){
-      message('Caught an error!')
-      print(e)
-    }
-  )
+  #  tryCatch(
+  #     expr = {
+  #       # First, calculate the distribution:
+  #       x = calcChromBinsRef(gr, "mm10")
+  #       chrom = c("chr1", "chr2","chr3","chr4","chr5",
+  #                 "chr6","chr7","chr8", "chr9", "chr10",
+  #                 "chr11","chr12","chr13","chr14","chr15",
+  #                 "chr16","chr17","chr18","chr19","chrX",
+  #                 "chrY")
+  #       x = x[x$chr %in% chrom,]
+  #       savePlots(dc, output, plotChromBins(x))
+  # 
+  #       message("Successfully calculated and plot chromosomes region distribution.")
+  #     },
+  #     error = function(e){
+  #       message('Caught an error!')
+  #       print(e)
+  #     }
+  #   )
+  # 
+  # # Region-TSS distance plot
+  # tryCatch(
+  #     expr = {
+  #      TSSdist = calcFeatureDistRefTSS(gr, "mm10")
+  #      savePlots(tss, output, plotFeatureDist(TSSdist, featureName="TSS"))
+  #      message("Successfully calculated and plot TSS distance.")
+  #     },
+  #     error = function(e){
+  #       message('Caught an error!')
+  #       print(e)
+  #     }
+  #   )
+  # 
+  # # Regions distribution over genomic partitions plot
+  # tryCatch(
+  #   expr = {
+  #    gp1 = calcPartitionsRef(gr, "mm10")
+  #    savePlots(gp, output, plotPartitions(gp1))
+  #    message("Successfully calculated and plot regions distribution over genomic partitions.")
+  #   },
+  #   error = function(e){
+  #     message('Caught an error!')
+  #     print(e)
+  #   }
+  # )
+  # 
+  # # Expected distribution over genomic partitions plot
+  # tryCatch(
+  #   expr = {
+  #    ep1 = calcExpectedPartitionsRef(gr, "mm10")
+  #    savePlots(ep, output, plotExpectedPartitions(ep1))
+  #    message("Successfully calculated and plot expected distribution over genomic partitions.")
+  #   },
+  #   error = function(e){
+  #     message('Caught an error!')
+  #     print(e)
+  #   }
+  # )
+  # 
+  # # Cumulative distribution over genomic partitions plot
+  # tryCatch(
+  #   expr = {
+  #    cp1 = calcCumulativePartitionsRef(gr, "mm10")
+  #    savePlots(cp, output, plotCumulativePartitions(cp1))
+  #    message("Successfully calculated and plot cumulative distribution over genomic partitions.")
+  #   },
+  #   error = function(e){
+  #     message('Caught an error!')
+  #     print(e)
+  #   }
+  # )
 
   # Cell specific enrichment for open chromatin plot
   tryCatch(
@@ -570,44 +591,44 @@ plotAllGD = function(gr, output){
       }
     )
 
-  # Distance between neighbor regions
-  tryCatch(
-    expr = {
-      nd1 = calcNeighborDist(gr)
-      savePlots(nd, output, plotNeighborDist(nd1))
-      message("Successfully calculated and plot distance between neighbor regions.")
-    },
-    error = function(e){
-      message('Caught an error!')
-      print(e)
-    }
-  )
-
-  # GC content plot
-  tryCatch(
-    expr = {
-     gc1 = calcGCContentRef(gr, "mm10")
-     savePlots(gc, output, plotGCContent(gc1))
-     message("Successfully calculated and plot GC content.")
-    },
-    error = function(e){
-      message('Caught an error!')
-      print(e)
-    }
-  )
-
-  # Quantile-trimmed histogram of widths
-  tryCatch(
-    expr = {
-      qt1 = calcWidth(gr)
-      savePlots(wh, output, plotQTHist(qt1))
-      message("Successfully calculated and plot quantile-trimmed histogram of widths.")
-    },
-    error = function(e){
-      message('Caught an error!')
-      print(e)
-    }
-  )
+#   # Distance between neighbor regions
+#   tryCatch(
+#     expr = {
+#       nd1 = calcNeighborDist(gr)
+#       savePlots(nd, output, plotNeighborDist(nd1))
+#       message("Successfully calculated and plot distance between neighbor regions.")
+#     },
+#     error = function(e){
+#       message('Caught an error!')
+#       print(e)
+#     }
+#   )
+# 
+#   # GC content plot
+#   tryCatch(
+#     expr = {
+#      gc1 = calcGCContentRef(gr, "mm10")
+#      savePlots(gc, output, plotGCContent(gc1))
+#      message("Successfully calculated and plot GC content.")
+#     },
+#     error = function(e){
+#       message('Caught an error!')
+#       print(e)
+#     }
+#   )
+# 
+#   # Quantile-trimmed histogram of widths
+#   tryCatch(
+#     expr = {
+#       qt1 = calcWidth(gr)
+#       savePlots(wh, output, plotQTHist(qt1))
+#       message("Successfully calculated and plot quantile-trimmed histogram of widths.")
+#     },
+#     error = function(e){
+#       message('Caught an error!')
+#       print(e)
+#     }
+#   )
 }
 
 
@@ -626,4 +647,79 @@ for (i in 1:length(gr_list)) {
   plotAllGD(gr_list[[i]], plot_list[[i]])
 }
   
+```
+## Cell type enrichment: number of cell types with median signal > 0.15
+
+```{r}
+# helper: convert region name vector to GRanges
+namesToGRanges <- function(names) {
+  df <- data.frame(name = names)
+  df <- df %>% extract("name", c("seqnames", "start", "end"),
+                       regex = "(.*)_([^_]+)_([^_]+)$")
+  df$start <- as.integer(df$start)
+  df$end <- as.integer(df$end)
+  makeGRangesFromDataFrame(df)
+}
+
+# count cell types with median signal > 0.1
+countEnrichedCellTypes <- function(gr, signalMatrix, threshold = 0.15) {
+  op <- calcSummarySignal(gr, signalMatrix)
+  medians <- op$matrixStats["median", ]
+  sum(medians > threshold, na.rm = TRUE)
+}
+
+
+# define paired groups: list of (up_gr, down_gr, label)
+paired_groups <- list(
+  list(up = pn_up_gr, down = pn_down_gr, label = "WT all"),
+  list(up = ph_up_gr, down = ph_down_gr, label = "Recruited all"),
+  list(up = th_up_gr, down = th_down_gr, label = "Tumoral all"),
+  list(up = namesToGRanges(pn_up_only), down = namesToGRanges(pn_down_only), label = "WT only"),
+  list(up = namesToGRanges(ph_up_only), down = namesToGRanges(ph_down_only), label = "Recruited only"),
+  list(up = namesToGRanges(th_up_only), down = namesToGRanges(th_down_only), label = "Tumoral only"),
+  list(up = namesToGRanges(pn_ph_up), down = namesToGRanges(pn_ph_down), label = "WT & Recruited"),
+  list(up = namesToGRanges(pn_th_up), down = namesToGRanges(pn_th_down), label = "WT & Tumoral"),
+  list(up = namesToGRanges(ph_th_up), down = namesToGRanges(ph_th_down), label = "Recruited & Tumoral"),
+  list(up = namesToGRanges(all_3_up), down = namesToGRanges(all_3_down), label = "WT & Recruited & Tumoral")
+)
+
+# compute counts for each paired group
+plot_data <- do.call(rbind, lapply(paired_groups, function(g) {
+  data.frame(
+    group = g$label,
+    direction = c("Up", "Down"),
+    count = c(countEnrichedCellTypes(g$up, openSignalMatrix_mm10),
+              countEnrichedCellTypes(g$down, openSignalMatrix_mm10))
+  )
+}))
+
+# add unpaired core renin-specific regions
+rs_gr <- namesToGRanges(rs)
+rs_row <- data.frame(
+  group = "Core renin-specific",
+  direction = "Up",
+  count = countEnrichedCellTypes(rs_gr, openSignalMatrix_mm10)
+)
+plot_data <- rbind(plot_data, rs_row)
+
+# set factor levels to preserve order
+plot_data$group <- factor(plot_data$group, levels = c(
+  "WT all", "Recruited all", "Tumoral all",
+  "WT only", "Recruited only", "Tumoral only",
+  "WT & Recruited", "WT & Tumoral", "Recruited & Tumoral",
+  "WT & Recruited & Tumoral", "Core renin-specific"
+))
+plot_data$direction <- factor(plot_data$direction, levels = c("Up", "Down"))
+
+# plot grouped bar chart
+p_celltype_count <- ggplot(plot_data, aes(x = group, y = count, fill = direction)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  scale_fill_manual(values = c("Up" = "#FF7F0E", "Down" = "#1F77B4")) +
+  labs(x = "", y = "Number of cell types with median signal > 0.1", fill = "Direction") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9))
+
+ggsave(file.path(plot_dir, "celltype_enrichment_count.svg"),
+       plot = p_celltype_count, width = 250, height = 150, units = "mm")
+
 ```

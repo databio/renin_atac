@@ -25,7 +25,7 @@ library(genomation)
 ## Set working directory
 
 ```{r, setup, include=FALSE}
-wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/geniml_univ_cc"
+wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/geniml_univ_cc_073126"
 knitr::opts_knit$set(root.dir = wd)
 ```
 
@@ -35,7 +35,7 @@ knitr::opts_knit$set(root.dir = wd)
 
 ```{r}
 # maxinum likelihood universe
-univ = "~/code/reninness_score/data/universe/universe_cc.bed"
+univ = "/home/bx2ur/code/reninness_score/data/universe_073126/universe_cc_073126.bed"
 
 # for renin vs non-renin
 meta = "~/code/renin_atac/metadata/renin_encode_atac.csv"
@@ -64,9 +64,9 @@ samples <- read.table(meta, header = TRUE, sep = ",")
 samples <- samples[(samples$Group != "Renin_Low"), ] # remove Renin_Low samples
 
 # for renin primary kidney cell vs encode
- # samples <- samples[(samples$Tissue != "As4.1"), ]
+ samples <- samples[(samples$Tissue != "As4.1"), ]
 # for renin as4.1 vs encode
-samples <- samples[(samples$Tissue == "As4.1" | samples$Group == "Non-Renin_Control"), ]
+# samples <- samples[(samples$Tissue == "As4.1" | samples$Group == "Non-Renin_Control"), ]
 
 # get sample names
 sample_name <- list(samples$SampleID)[[1]]
@@ -126,6 +126,7 @@ getConsensusPeaks <- function(peaks, univ) {
 }
 
 # FEATURE COUNTS & QUANTILES NORMALIZATION
+
 countFeatures <- function(bams, bamp, regionsToCount, nthreads = 2){
   # feature counts for singleton
   fcs <- featureCounts(bams[[1]],
@@ -154,6 +155,7 @@ countFeatures <- function(bams, bamp, regionsToCount, nthreads = 2){
   
   return(list(fc, fc_norm, nfactors))
 }
+
 ```
 
 ## Run consensus peaks & feature counting
@@ -166,7 +168,7 @@ reducedConsensus = reducedConsensus[, sample_name]
 regionsToCount = output[[2]]
 
 # counting features & normalizing counts
-output = countFeatures(bams.files, bamp.files, regionsToCount, nthreads = 1 )
+output = countFeatures(bams.files, bamp.files, regionsToCount, nthreads = 8 )
 fc = output[[1]]           # pre normalized counts
 fc_norm = output[[2]]      # normalized counts
 nfactors = output[[3]]     # normalization factors
@@ -177,12 +179,27 @@ df %>%
 df[c('chr', 'start', 'end')] <- str_split_fixed(df$rownames.fc_norm, "_", 3)
 df = df[c('chr', 'start', 'end', 'rownames.fc_norm.')]
 
-write.table( x =df, 
-             file = 'ConsensusPeaks.bed', sep="\t", 
+write.table( x =df,
+             file = 'ConsensusPeaks.bed', sep="\t",
              quote=FALSE, col.names = FALSE, row.names = FALSE)
 
-# save.image("renin_encode_atac_primary.RData")
-save.image("renin_encode_atac_tumoral.RData")
+save.image("renin_encode_atac_primary.RData")
+# save.image("renin_encode_atac_tumoral.RData")
+```
+```{r}
+# save normalized feature count matrix
+bed <- file.path(wd, "bed/renin_specific_regions.bed")
+
+regions <- read.table(bed, sep="\t", header=FALSE,
+                      stringsAsFactors = FALSE)$V4
+keep_ <- regions[regions %in% rownames(fc_norm)]
+fc_sub <- fc_norm[keep_,,drop=FALSE]
+fc_t <- t(fc_sub)
+out <- data.frame(peak_id = rownames(fc_sub), fc_sub,
+                  check.names = FALSE, row.names = NULL)
+write.csv(out,
+          file=file.path(wd,paste0("fc_norm_renin_specifc_", Sys.Date(),".csv")),
+          quote = FALSE, row.names = FALSE)
 ```
 
 # 1c. Visualization
@@ -280,7 +297,7 @@ plotHeatmap <- function(fc, peak_range, renin_samples, myDesign, normalization, 
   ggsave(paste0(output_dir, "/fig/", title, ".svg"),
          plot = plot, width = 174, height = 174, units = "mm")
 
-  plot
+  # plot
 }
 
 plotPeaks <- function(fc, peak_range, renin_samples, myDesign, normalization, output_dir) {
@@ -330,7 +347,7 @@ plotPeaks <- function(fc, peak_range, renin_samples, myDesign, normalization, ou
   ggsave(paste0(output_dir, "/fig/", title, " peaks.svg"),
          plot = plot, width = 174, height = 174, units = "mm")
 
-  plot
+  # plot
 }
 
 plotLine <- function(fc, peak_range, renin_samples, myDesign, normalization, output_dir) {
@@ -378,7 +395,7 @@ plotLine <- function(fc, peak_range, renin_samples, myDesign, normalization, out
   ggsave(paste0(output_dir, "/fig/", title, " line.svg"),
          plot = plot, width = 174, height = 174, units = "mm")
 
-  plot
+  # plot
 }
 
 plotBox <- function(fc, peak_range, renin_samples, myDesign, normalization, output_dir) {
@@ -405,7 +422,7 @@ plotBox <- function(fc, peak_range, renin_samples, myDesign, normalization, outp
   ggsave(paste0(output_dir, "/fig/", title, " box.svg"),
          plot = plot, width = 174, height = 174, units = "mm")
 
-  plot
+  # plot
 }
 ```
 

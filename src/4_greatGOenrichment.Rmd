@@ -15,14 +15,58 @@ This document 1) performs the GO enrichment analysis on differentially accessibl
 library(rGREAT)
 library(ggplot2)
 library(data.table)
-library(dplyr)
 library(genomation)
+# GO.db attaches AnnotationDbi, which masks dplyr::select -- load it before
+# dplyr so dplyr's verbs win the masking order
+library(GO.db)
+library(dplyr)
+library(tidyr)   # pivot_wider, for the directional significance marks
 ```
+
+## Ontology / database versions
+
+Two different GO releases are in play in this document and they do NOT match:
+
+* **GREAT** (queried over the network by `submitGreatJob`) does the enrichment
+  test against its own, older, bundled GO release. It returns 13,090 GO
+  Biological Process terms for mm10.
+* **GO.db** is used locally, in `getReninGOTerms()`, only to expand the anchor
+  GO IDs to their descendants.
+
+`1694 / 13090` = **12.9%** of the GO IDs GREAT reports no longer exist in the
+installed GO.db. Those terms have no ancestry in GO.db, so anchor expansion
+cannot reach them; they are only matched if their ID is listed explicitly in
+the alias vector in `getReninGOTerms()`. This is why the obsolete anchor
+`GO:0019933` silently emptied the whole cAMP branch. Record the versions below
+with any figure generated from this document, and re-check the anchor list
+after any Bioconductor upgrade.
+
+```{r}
+# versions actually used for the results in this document
+cat("R            :", R.version.string, "\n")
+for (p in c("rGREAT", "GO.db", "AnnotationDbi", "genomation", "dplyr", "ggplot2")) {
+  cat(sprintf("%-13s: %s\n", p, as.character(packageVersion(p))))
+}
+# GREAT server version used by submitGreatJob(); mm10 is served by GREAT v4
+cat("GREAT server : v4 (mm10), ontology release bundled server-side\n")
+```
+
+<!--
+Versions used for the figures committed alongside this document (2026-08-31):
+  R            : 4.6.0 (2026-04-24)
+  rGREAT       : 2.14.0        GREAT server: v4, genome mm10
+  GO.db        : 3.23.1
+  AnnotationDbi: 1.74.0
+  genomation   : 1.44.0
+  dplyr        : 1.2.1
+  ggplot2      : 4.0.3
+  GREAT returned 13090 GO BP terms; 1694 (12.9%) are absent from GO.db 3.23.1.
+-->
 
 ## Set working directory
 
 ```{r setup, include=FALSE}
-wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/geniml_univ_cc"
+wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/geniml_univ_cc_073126"
 knitr::opts_knit$set(root.dir = wd)
 ```
 
@@ -35,7 +79,7 @@ bed_dir = "bed"
 
 bed_paths = list(
   all_up = file.path(bed_dir, "deseq_all_diff_up.bed"),        # all inc accessibility region
-  all_down = file.path(bed_dir, "deseq_all_diff_down.bed"),    # all inc accessibility region
+  all_down = file.path(bed_dir, "deseq_all_diff_down.bed"),    # all dec accessibility region
   non_differential = file.path(bed_dir, "deseq_non_diff.bed"),          # all non-differential region
   renin = file.path(bed_dir, "renin_specific_regions.bed") # renin specific regions
 )
@@ -170,111 +214,38 @@ plotTopEnrichedGO(differential_enrichment_results, n = 20, output = output_plot)
 ```{r}
 # define function
 
-filterEnrichment = function(df) {
-  go = subset(df, df$Hyper_Adjp_BH <= 0.1 & Hyper_Foreground_Gene_Hits >= 3)
-  rownames(go) = seq_len(nrow(go))
-  return(go)
-}
-
-getTopGOTerms = function(dfs, n = 50) {
-  # get the top enriched go terms in each region set by fold enrichment 
-  top_fold = unlist(lapply(dfs, function(x) {
-    x = x[order(-x$Hyper_Fold_Enrichment), ]
-    head(na.omit(x$name), n)
-  }))
-  # get the top enriched go terms in each region set by p-value
-  top_pval = unlist(lapply(dfs, function(x) {
-    x = x[order(x$Hyper_Adjp_BH), ]
-    head(na.omit(x$name), n)
-  }))
-
-  unique(c(
-    top_fold,
-    top_pval
-    ))
-}
-
-getReninGOTerms = function(dfs, n = 50) {
-  # get renin related go terms
-  keywords = c(
-    "notch", "cAMP", 
-    "angiotensin", "aldosterone", "renin", 
-    "vasculogenesis", "blood vessel", 
-    "arteriole", "blood pressure",
-    "smooth muscle cell",
-    "cell fate", 
-    "kidney", "renal", "nephron"
-  )
-
-  # Create a single regex pattern
-  pattern = paste(keywords, collapse = "|")
-
-  # Extract matching GO terms from all input tables
-  matched_terms = unlist(lapply(dfs, function(df) {
-    df$name[grepl(pattern, df$name, ignore.case = TRUE)]
-  }))
-
-  # Return unique terms
-  unique(matched_terms)
-}
-
-getRank = function(df, group) {
-  df = df[order(df$Hyper_Adjp_BH), ]
-  df$rank_pvalue = seq_len(nrow(df))
-  df = df[order(df$Hyper_Fold_Enrichment), ]
-  df$rank_fold = seq_len(nrow(df))
-  df$Rank = rowMeans(df[, c('rank_pvalue', 'rank_fold')])
-  df$Group = group
-  return(df)
-}
-
-getRankWeight = function(dfs, my_go_terms) {
-  total = max(sapply(dfs, nrow))
-
-  # First: compute rank_pvalue_weight and filter
-  for (i in seq_along(dfs)) {
-    dfs[[i]]$rank_pvalue_weight = (total - dfs[[i]]$rank_fold)/total
-    dfs[[i]] = subset(dfs[[i]], name %in% my_go_terms)
-  }
-
-  # Then: calculate sum of rank_pvalue_weight for each term across all dfs
-  for (t in my_go_terms) {
-  # Sum the weights across all dfs for this term
-  term_sum = sum(sapply(dfs, function(df) {
-    w = df$rank_pvalue_weight[df$name == t]
-    if (length(w) == 0) return(0)
-    return(w)
-  }))
-  # Assign normalized weights back to each df
-  for (i in seq_along(dfs)) {
-    idx = dfs[[i]]$name == t
-    if (any(idx)) {
-      dfs[[i]]$rank_weight[idx] = dfs[[i]]$rank_pvalue_weight[idx] / term_sum
-    }
-  }
-}
-  return(dfs)
-}
-
-
+# filterEnrichment / getTopGOTerms / getReninGOTerms / getRank /
+# getRankWeight now live in go_enrichment_functions.R, shared with
+# 8_deseq2_vs_starspace_regions.Rmd (8j) so the two cannot drift apart
+# again. Edit them there.
+source("go_enrichment_functions.R")
 ```
 
 ```{r}
-# filter results
-go_results = lapply(renin_enrichment_results, filterEnrichment)
+# flag significance on the FULL tables; every term is kept so that ranking in
+# getRankWeight sees both region sets
+go_results_all = lapply(renin_enrichment_results, function(df) {
+  df$sig = !is.na(df$Hyper_Adjp_BH) &
+    df$Hyper_Adjp_BH <= 0.1 &
+    df$Hyper_Foreground_Gene_Hits >= 3
+  df
+})
 
-# get list of GO terms
+# significance-filtered tables, used only to choose which terms to plot
+go_results = lapply(go_results_all, filterEnrichment)
+
+# renin-related GO terms that are significant in at least one region set
 my_go_terms = getReninGOTerms(go_results)
 ```
 
 # 4e. Plot weighted rank of the renin related GO terms: core renin specific region vs other increasing accessibility regions
 
 ```{r}
-rank_dfs = lapply(names(go_results), function(set) {
-  getRank(go_results[[set]], group = set)
+rank_dfs = lapply(names(go_results_all), function(set) {
+  getRank(go_results_all[[set]], group = set)
 })
 
-names(rank_dfs) = names(go_results)
+names(rank_dfs) = names(go_results_all)
 
 rank_dfs = getRankWeight(rank_dfs, my_go_terms)
 
@@ -282,23 +253,66 @@ plot_this = do.call(rbind, rank_dfs)
 plot_this = plot_this[!is.na(plot_this$name), ]
 rownames(plot_this) = NULL
 
+# WHICH region set called each term significant -- not just how many. The old
+# code counted (`n_sig = sum(sig)`) and marked every count-of-1 with the same
+# "*", so a term significant only in the core renin set and a term significant
+# only in the other set carried an identical flag. On the 50-term figure that
+# was 7 core-only vs 34 other-only under one symbol, i.e. the mark meant the
+# OPPOSITE of the intended reading 83% of the time. Direction is now recorded.
+sig_by_set = plot_this %>%
+  dplyr::select(name, Group, sig) %>%
+  tidyr::pivot_wider(names_from = Group, values_from = sig,
+                     names_prefix = "sig_") %>%
+  dplyr::mutate(
+    n_sig = as.integer(sig_renin_specific) + as.integer(sig_other),
+    sig_class = dplyr::case_when(
+      sig_renin_specific &  sig_other ~ "both",
+      sig_renin_specific & !sig_other ~ "core_only",
+      !sig_renin_specific & sig_other ~ "other_only",
+      TRUE                            ~ "neither"))
+
+# directional marks. dagger = significant in the core renin-specific set only,
+# double dagger = significant in the other increased-accessibility set only,
+# unmarked = significant in both. Keep these in sync with the plot caption.
+MARK_CORE  = "\u2020"   # dagger
+MARK_OTHER = "\u2021"   # double dagger
+markTerm = function(nm, cls) {
+  ifelse(cls == "core_only",  paste0(nm, " ", MARK_CORE),
+  ifelse(cls == "other_only", paste0(nm, " ", MARK_OTHER), nm))
+}
+
+# NOTE: GO.db attaches AnnotationDbi, which masks dplyr::select with an S4
+# generic that has no data.frame method -- qualify the verb explicitly.
 data = plot_this %>%
-  select(name, Group, Rank_weight = rank_weight, Pval_rank = rank_pvalue,
-         Pval_rank_weight = rank_pvalue_weight)
+  dplyr::left_join(sig_by_set, by = "name") %>%
+  dplyr::select(name, Group, n_sig, sig_class, Rank_weight = rank_weight,
+                Fold_rank_weight = rank_fold_weight)
 
 data$Group = factor(data$Group, levels = c("renin_specific", "other"))
 
-order = data %>%
-  filter(Group == "renin_specific") %>%
-  arrange(desc(Rank_weight)) %>%
-  mutate(labels = factor(name)) %>%
-  head(50)
+# named term_order, not `order`: a variable called `order` shadows base::order,
+# which getRank() calls, so re-running these chunks in one session breaks it.
+# Keep every term whose weight favours the core renin-specific set, rather than
+# a fixed top-N. head(50) was arbitrary and cut terms mid-way through the
+# near-tie band; > 0.5 is the point the metric actually means something ("ranked
+# higher by fold enrichment in the core set"). Currently yields 37 terms.
+WEIGHT_CUTOFF = 0.5
+term_order = data %>%
+  dplyr::filter(Group == "renin_specific", Rank_weight > WEIGHT_CUTOFF) %>%
+  dplyr::arrange(desc(Rank_weight)) %>%
+  dplyr::mutate(labels = factor(name))
 
-data_new = filter(data, name %in% order$name)
+data_new = dplyr::filter(data, name %in% term_order$name)
 new_order = data_new %>%
-  filter(Group == "renin_specific") %>%
-  arrange(desc(Rank_weight)) %>%
-  mutate(labels = factor(name))
+  dplyr::filter(Group == "renin_specific") %>%
+  dplyr::arrange(desc(Rank_weight)) %>%
+  dplyr::mutate(labels = markTerm(name, sig_class))
+
+message(sprintf("Fig 2D: %d terms with weight > %.2f | %d significant in the core set (%d of them core-exclusive) | %d significant only in the other set",
+        nrow(new_order), WEIGHT_CUTOFF,
+        sum(new_order$sig_class %in% c("both", "core_only")),
+        sum(new_order$sig_class == "core_only"),
+        sum(new_order$sig_class == "other_only")))
 ```
 
 ```{r}
@@ -309,10 +323,10 @@ plot_width <- max(6, 0.25 * n_terms + 2)
 
 # Build and save the plot
 p <- data_new %>%
-  mutate(labels = factor(name, levels = new_order$labels)) %>%
+  dplyr::mutate(labels = factor(markTerm(name, sig_class), levels = new_order$labels)) %>%
   ggplot(aes(fill = Group, y = Rank_weight, x = labels)) + 
   geom_bar(position = "fill", stat = "identity", width = 0.9) +
-  scale_fill_manual(values = c("renin_specific" = "#e1812c", "others" = "lightgrey")) +
+  scale_fill_manual(values = c("renin_specific" = "#e1812c", "other" = "lightgrey")) +
   theme_bw() +
   theme(
     axis.text.x = element_text(angle = 90, hjust = 1, size = 6, color = "black"),
@@ -320,7 +334,10 @@ p <- data_new %>%
     axis.title = element_text(size = 8, color = "black"),
     panel.grid = element_blank(),
   ) +
-  labs(y = "Enrichment Weight", x = "GO Terms")
+  labs(y = "Enrichment Weight", x = "GO Terms",
+       caption = paste0(MARK_CORE, " significant in the core renin-specific regions only    ",
+                        MARK_OTHER, " significant in the other increased-accessibility regions only    ",
+                        "(unmarked: significant in both)"))
 
 ggsave(output_file,
        plot = p,

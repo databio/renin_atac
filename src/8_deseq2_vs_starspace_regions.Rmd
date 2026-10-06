@@ -8,8 +8,9 @@ editor_options:
     wrap: 72
 ---
 
-This document 1) builds region-class assignments directly from a trained
-StarSpace model via k-means clustering, 2) compares them to DESeq2
+This document 1) loads region-class assignments made from a trained
+StarSpace model (nearest-label cosine clustering, computed in
+`src/7_Evaluating_reninness_scoring_tool.ipynb`), 2) compares them to DESeq2
 differentially-accessible region sets, and 3) plots tornado signal
 profiles of motif-bound regions stratified by both axes.
 
@@ -18,12 +19,15 @@ profiles of motif-bound regions stratified by both axes.
 ## Load packages
 
 ```{r}
+# GenomicDistributions / GenomicDistributionsData / venn were attached here
+# but no symbol from any of them is referenced in this document -- the
+# genomic-distribution panels and the venn()-based set partition live in
+# 3_plot_genomic_distributions.Rmd. Dropped 2026-09-05.
+# stringr and ggplot2 are attached by tidyverse; listed explicitly because
+# str_match() and ggplot() are used directly throughout.
 library(genomation)
-library(GenomicDistributions)
-library(GenomicDistributionsData)
 library(UpSetR)
 library(tidyverse)
-library(venn)
 library(EnrichedHeatmap)
 library(rtracklayer)
 library(stringr)
@@ -33,7 +37,7 @@ library(ggplot2)
 ## Set working directory
 
 ```{r, setup, include=FALSE}
-wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/geniml_univ_cc"
+wd = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/differential/geniml_univ_cc_073126"
 knitr::opts_knit$set(root.dir = wd)
 ```
 
@@ -42,9 +46,6 @@ knitr::opts_knit$set(root.dir = wd)
 ### DESeq2 input
 
 ```{r}
-primary_dir = "primary"
-tumoral_dir = "tumoral"
-
 # DESeq2 differential-accessibility reports
 primary_normal_file = "deseq/deseq_normal_primary_report_shrink.csv"
 as_normal_file      = "deseq/deseq_normal_tumoral_report_shrink.csv"
@@ -55,13 +56,21 @@ primary_high_file   = "deseq/deseq_high_primary_report_shrink.csv"
 
 ```{r}
 # Trained StarSpace model
-starspace_model_path = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/reninness_score_output_new/universe_cc/d50_e10_m0.1/model_d50_e10_m0.1.tsv"
+# n_starspace_labels = how many "__label__" rows the model was trained with;
+# StarSpace writes them as the last rows of model.tsv. The joint_l3 model has
+# three (Control, Tumoral, Renin); older 2-class models have two.
+n_starspace_labels = 3
+# focus_label = the cluster 8d-8j treat as the signal side. Every other label
+# is pooled into the "everything else" contrast that feeds the `_nr` sets, so
+# the renin-vs-rest framing of the paper survives the move from 2 to 3 labels.
+focus_label = "Renin"
+starspace_model_path = "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline/reninness_score_l3_upsampled/sweep/dim100_ep50_mar0.4_neg50/model_dim100_ep50_mar0.4_neg50.tsv"
 ```
 
 ### Universe
 
 ```{r}
-universe_file = "/home/bx2ur/code/reninness_score/data/universe/universe_cc.bed"
+universe_file = "/home/bx2ur/code/reninness_score/data/universe_073126/universe_cc_073126.bed"
 ```
 
 ### Output
@@ -71,842 +80,38 @@ bed_dir = "bed"
 plot_dir = "plot"
 ```
 
-### Metadata
+# 8b. Load StarSpace region clusters
+
+Region-to-label assignment is done in
+`src/7_Evaluating_reninness_scoring_tool.ipynb` ("Region embedding colored by
+nearest-label cluster"), which writes `bed/cluster_regions.csv`. That notebook
+already reads `model.tsv` to draw the region embedding, so clustering there
+keeps one implementation instead of two that can drift; it also puts the
+cluster figure and the log2FoldChange figure on the same fitted embedding.
+
+Each region is assigned to the label vector it is closest to by cosine
+similarity, giving one cluster per trained label — `Renin` / `Non_Renin` for a
+2-label model, `Control` / `Tumoral` / `Renin` for a 3-label one. Re-run that
+notebook section to refresh the CSV after training a new model.
 
 ```{r}
-meta = "~/code/renin_atac/metadata/renin_encode_atac.csv"
-```
-
-# 8b. Build StarSpace region clusters from trained model
-
-`cluster_starspace_regions()` reads the trained model's word/
-embeddings, k-means-clusters the region rows (skipping the last 2
-trained label rows), then maps each cluster to `Renin` / `Non-renin` by
-cosine similarity between the cluster centroid and the trained label
-vectors. K-means is O(n·k·i) --- much faster than DBSCAN's O(n²) at
-typical region counts (10k--1M) and produces a clean 2-way split that
-mirrors the model's two trained classes.
-
-## Define functions
-
-```{r}
-cluster_starspace_regions <- function(
-    model_path,
-    n_clusters = 2,
-    method = c("spherical_kmeans", "cosine_nearest", "hdbscan", "umap_hdbscan"),
-    seed = 42,
-    renin_label = "Renin",
-    non_renin_label = "Non_Renin",
-    output_renin = "Renin",
-    output_non_renin = "Non-renin",
-    output_other = "other",
-    margin_threshold = 0,  # |cos_renin - cos_non_renin| < this -> output_other
-                           # Applies in cosine_nearest method AND in the post-hoc
-                           # cosine_override step (so HDBSCAN/k-means results
-                           # also get a "other" band when margin > 0).
-    minPts = 50,          # smaller = more sub-clusters along elongated streaks
-    hdb_max_n = 20000,    # subsample cap for HDBSCAN (O(n²) memory at scale)
-    hdb_pca_dim = 15,     # PCA-reduce to this dim before HDBSCAN (NULL = skip)
-    label_method = c("cluster_cosine_nearest", "one_per_label"),
-    init_at_labels = FALSE, # spherical_kmeans: TRUE to seed centroids at label vectors
-                           # (only useful when labels sit near data centers — for the
-                           # typical hinge-loss case where labels land at cluster tips,
-                           # this biases the partition. Keep FALSE.)
-    cosine_override = TRUE, # post-hoc: flip a region's label if its per-region cosine
-                            # to the OTHER label vector exceeds cosine to the assigned
-                            # one. Targets streak-tip / boundary mis-assignments from
-                            # centroid propagation. Set FALSE to disable.
-    spatial_smooth = TRUE,           # grow "other" via k-NN: regions whose neighbors
-                                     # are mostly "other" also become "other". Captures
-                                     # the geometric extent of the sub-cluster even when
-                                     # individual cosine values exceed margin_threshold.
-                                     # Requires margin_threshold > 0 and FNN package.
-    spatial_smooth_k = 15,           # neighbors per region for propagation
-    spatial_smooth_thresh = 0.5,     # fraction of neighbors that must be "other"
-    spatial_smooth_max_iter = 5,     # iteration cap (label propagation converges fast)
-    umap_subcluster = c("hdbscan", "kmeans") # only used by method = "umap_hdbscan".
-                                             # "kmeans" forces n_clusters groups in the
-                                             # 2D UMAP space (useful when sub-clusters
-                                             # are density-connected so HDBSCAN merges
-                                             # them).
-) {
-  umap_subcluster <- match.arg(umap_subcluster)
-  label_method <- match.arg(label_method)
-  method <- match.arg(method)
-  # StarSpace's `model.tsv` is one row per token, no header:
-  #   <token>\t<v1>\t...\t<vd>
-  # Tokens are in vocabulary order, which depends on training config —
-  # label rows ("__label__Renin", "__label__Non_Renin") are NOT
-  # guaranteed to sit at the bottom. Identify labels by the "__label__"
-  # prefix instead of by position (matches geniml's evaluate.py).
-  embed <- read.table(
-    model_path, sep = "\t", header = FALSE,
-    comment.char = "", quote = "", stringsAsFactors = FALSE,
-    fill = TRUE
-  )
-  embed <- embed[!is.na(embed[, 1]) & embed[, 1] != "", , drop = FALSE]
-
-  is_label    <- grepl("^__label__", embed[, 1])
-  label_rows  <- embed[ is_label, , drop = FALSE]
-  region_rows <- embed[!is_label, , drop = FALSE]
-
-  if (nrow(label_rows) < 2) {
-    stop(sprintf(
-      "model.tsv has only %d label row(s) (prefix '__label__'); expected at least 2.",
-      nrow(label_rows)
-    ))
-  }
-  if (nrow(region_rows) < n_clusters) {
-    stop(sprintf("Only %d region rows in model.tsv; need at least n_clusters = %d.",
-                 nrow(region_rows), n_clusters))
-  }
-
-  region_names <- region_rows[, 1]
-  region_emb   <- as.matrix(region_rows[, -1])
-  storage.mode(region_emb) <- "double"
-
-  label_names <- label_rows[, 1]
-  label_emb   <- as.matrix(label_rows[, -1])
-  storage.mode(label_emb) <- "double"
-
-  # Locate the two label rows by name (after stripping the "__label__" prefix).
-  stripped      <- gsub("^__label__", "", label_names)
-  renin_idx     <- which(stripped == renin_label)
-  non_renin_idx <- which(stripped == non_renin_label)
-  if (length(renin_idx) != 1 || length(non_renin_idx) != 1) {
-    stop(sprintf(
-      "Could not locate both '%s' and '%s' label rows; found label rows: %s",
-      renin_label, non_renin_label, paste(stripped, collapse = ", ")
-    ))
-  }
-  renin_vec     <- label_emb[renin_idx,     ]
-  non_renin_vec <- label_emb[non_renin_idx, ]
-
-  # Per-region cosine similarity to each label vector — reused by both
-  # methods below and for the optional margin filter.
-  cs_to <- function(M, v) {
-    n <- sqrt(rowSums(M * M)) * sqrt(sum(v * v))
-    as.numeric((M %*% v) / pmax(n, 1e-12))
-  }
-  cos_renin     <- cs_to(region_emb, renin_vec)
-  cos_non_renin <- cs_to(region_emb, non_renin_vec)
-
-  if (method == "cosine_nearest") {
-    # Per-region direct assignment: each region goes to its nearest label
-    # vector by cosine. This is the cosine bisector partition — by
-    # construction, it agrees pointwise with the cosine-metric UMAP and
-    # with the cos_renin/cos_non_renin axes used in 8f. No k-means, no
-    # global optimization that can disagree with local structure.
-    #
-    # Only meaningful for n_clusters = 2 (one cluster per label). For
-    # n_clusters > 2, fall back to spherical k-means.
-    if (n_clusters != 2) {
-      warning("method='cosine_nearest' assumes n_clusters=2; falling back to spherical_kmeans.")
-      method <- "spherical_kmeans"
-    } else {
-      title_vec <- ifelse(cos_renin > cos_non_renin,
-                          output_renin, output_non_renin)
-
-      # Optional margin filter: regions where the two cos-sims are too
-      # close get marked output_other instead of forced into one cluster.
-      # margin_threshold = 0 keeps the original "nearest" behavior.
-      if (margin_threshold > 0) {
-        ambig <- abs(cos_renin - cos_non_renin) < margin_threshold
-        title_vec[ambig] <- output_other
-        message(sprintf(
-          "  margin_threshold=%.3f marked %s/%s regions as '%s'",
-          margin_threshold,
-          format(sum(ambig), big.mark = ","),
-          format(length(ambig), big.mark = ","),
-          output_other
-        ))
-      }
-    }
-  }
-
-  if (method == "spherical_kmeans") {
-    # Normalize each region to unit norm before k-means. Makes Euclidean
-    # distance equivalent to cosine distance on the sphere, so the
-    # k-means boundary aligns with cosine — usually agrees with UMAP
-    # except for a few boundary regions.
-    region_emb_norm <- region_emb / sqrt(rowSums(region_emb * region_emb))
-    region_emb_norm[!is.finite(region_emb_norm)] <- 0
-
-    # init_at_labels: seed the first two centroids at the unit-normalized
-    # label vectors. K-means then refines from there — first iteration's
-    # assignment is exactly "nearest label by cosine", subsequent
-    # iterations let centroids drift toward data density without losing
-    # the label-anchored partition. Disables nstart (no random restarts).
-    set.seed(seed)
-    if (init_at_labels) {
-      norm_unit <- function(v) v / max(sqrt(sum(v * v)), 1e-12)
-      init_centers <- rbind(norm_unit(renin_vec), norm_unit(non_renin_vec))
-      if (n_clusters > 2) {
-        # Pick the remaining (n_clusters - 2) initial centers from the
-        # region embeddings, far from the two label-anchored seeds.
-        d_to_seeds <- pmin(
-          sqrt(rowSums(sweep(region_emb_norm, 2, init_centers[1, ], `-`)^2)),
-          sqrt(rowSums(sweep(region_emb_norm, 2, init_centers[2, ], `-`)^2))
-        )
-        extra_idx <- order(d_to_seeds, decreasing = TRUE)[seq_len(n_clusters - 2)]
-        init_centers <- rbind(init_centers, region_emb_norm[extra_idx, , drop = FALSE])
-      }
-      km <- kmeans(region_emb_norm, centers = init_centers, iter.max = 50)
-    } else {
-      km <- kmeans(region_emb_norm, centers = n_clusters,
-                   nstart = 10, iter.max = 50)
-    }
-
-    centroids  <- km$centers
-    sims_renin <- apply(centroids, 1, function(c) {
-      s <- sqrt(sum(c*c)) * sqrt(sum(renin_vec * renin_vec))
-      if (s == 0) 0 else sum(c * renin_vec) / s
-    })
-    sims_nr <- apply(centroids, 1, function(c) {
-      s <- sqrt(sum(c*c)) * sqrt(sum(non_renin_vec * non_renin_vec))
-      if (s == 0) 0 else sum(c * non_renin_vec) / s
-    })
-
-    if (label_method == "cluster_cosine_nearest") {
-      # Every cluster commits to Renin or Non-renin based on its centroid's
-      # cosine sim. With n_clusters > 2, multiple clusters can carry the
-      # same label — no "other" bucket. Useful when you want a strictly
-      # binary partition but also want k-means to find finer sub-structure.
-      cluster_to_label <- ifelse(sims_renin >= sims_nr,
-                                  output_renin, output_non_renin)
-    } else {
-      # Original "one per label": assign the closest cluster to each
-      # label, rest as "other". Surfaces sub-structure that doesn't
-      # align with either label.
-      cluster_to_label <- rep(output_other, nrow(centroids))
-      cluster_to_label[which.max(sims_renin)] <- output_renin
-      for (idx in order(sims_nr, decreasing = TRUE)) {
-        if (cluster_to_label[idx] == output_other) {
-          cluster_to_label[idx] <- output_non_renin
-          break
-        }
-      }
-    }
-    title_vec <- cluster_to_label[km$cluster]
-  }
-
-  if (method == "hdbscan" || method == "umap_hdbscan") {
-    # Shared pipeline for both density-based methods. Both run the same
-    # pre-clustering steps and differ ONLY in where HDBSCAN gets its input:
-    #
-    #   (1) normalize HD embeddings
-    #   (2) subsample hdb_max_n ("y") regions
-    #   (3) PCA-fit on the y subsample → hdb_pca_dim ("x") dims; project
-    #       full 423k regions and label vectors through the same rotation
-    #   (4) fit UMAP on the y × x PCA subsample → 2D coords + model
-    #   (5) HDBSCAN runs on either:
-    #         - "umap_hdbscan": the 2D UMAP coords (visible-blob clustering)
-    #         - "hdbscan":      the xD PCA subsample (original-geometry)
-    #   (6) label each cluster by centroid cosine sim in HD space
-    #   (7) propagate to all 423k regions via k-NN majority vote in PCA space
-    #
-    # Diagnostic intent: at the same (x, y) the saved UMAP layout is
-    # IDENTICAL across the two methods, so any topology/coloring diff is
-    # attributable purely to the HDBSCAN input space. Sweep x to test the
-    # PCA-reduction effect; sweep y to test the UMAP-training-set effect.
-    pkgs <- c("uwot", "dbscan", "RANN")
-    missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
-    if (length(missing) > 0) {
-      stop(sprintf("hdbscan/umap_hdbscan need: %s. install.packages('%s', lib = .libPaths()[1])",
-                   paste(missing, collapse = ", "),
-                   paste(missing, collapse = "', '")))
-    }
-
-    # ---- (1) normalize ---------------------------------------------------
-    region_emb_norm <- region_emb / sqrt(rowSums(region_emb * region_emb))
-    region_emb_norm[!is.finite(region_emb_norm)] <- 0
-    n_total <- nrow(region_emb_norm)
-
-    label_emb_norm <- label_emb / sqrt(rowSums(label_emb * label_emb))
-    label_emb_norm[!is.finite(label_emb_norm)] <- 0
-
-    # ---- (2) subsample y regions ----------------------------------------
-    set.seed(seed)
-    if (n_total > hdb_max_n) {
-      sub_idx <- sort(sample.int(n_total, hdb_max_n))
-      message(sprintf("  Subsampling %s of %s regions (hdb_max_n=%d)",
-                      format(hdb_max_n, big.mark = ","),
-                      format(n_total,   big.mark = ","), hdb_max_n))
-    } else {
-      sub_idx <- seq_len(n_total)
-    }
-    emb_sub <- region_emb_norm[sub_idx, , drop = FALSE]   # HD subsample
-
-    # ---- (3) PCA on y-subsample, project full 423k via rotation ---------
-    # PCA fit on the subsample (fast, numerically very close to a full-data
-    # fit at y ≥ 20k); both branches share one rotation so the comparison
-    # isolates the HDBSCAN input space. Set hdb_pca_dim to ncol(region_emb)
-    # (e.g. 50) to skip PCA entirely — used as the "no PCA reduction"
-    # configuration in the x-sweep.
-    if (!is.null(hdb_pca_dim) && hdb_pca_dim < ncol(emb_sub)) {
-      message(sprintf("  PCA: %d → %d dims (fit on %s subsample, project full data + labels)",
-                      ncol(emb_sub), hdb_pca_dim,
-                      format(nrow(emb_sub), big.mark = ",")))
-      pca <- prcomp(emb_sub, center = TRUE, scale. = FALSE, rank. = hdb_pca_dim)
-      emb_sub_pca <- pca$x
-      region_emb_pca_all <- scale(region_emb_norm, center = pca$center,
-                                  scale = FALSE) %*%
-                            pca$rotation[, seq_len(hdb_pca_dim), drop = FALSE]
-      label_emb_pca <- scale(label_emb_norm, center = pca$center,
-                             scale = FALSE) %*%
-                       pca$rotation[, seq_len(hdb_pca_dim), drop = FALSE]
-    } else {
-      message(sprintf("  PCA: skipped (hdb_pca_dim=%s ≥ input dim=%d)",
-                      ifelse(is.null(hdb_pca_dim), "NULL",
-                             as.character(hdb_pca_dim)),
-                      ncol(emb_sub)))
-      pca <- NULL
-      emb_sub_pca <- emb_sub
-      region_emb_pca_all <- region_emb_norm
-      label_emb_pca <- label_emb_norm
-    }
-
-    # ---- (4) UMAP on y × x PCA subsample --------------------------------
-    # ret_model = TRUE so plot_starspace_clusters can reuse this exact
-    # layout (saved as attributes below) and so label vectors can be
-    # projected in. Identical across both methods at the same (x, y).
-    message(sprintf("Running UMAP on %s × %d to 2D (cosine metric)...",
-                    format(nrow(emb_sub_pca), big.mark = ","),
-                    ncol(emb_sub_pca)))
-    umap_model  <- uwot::umap(emb_sub_pca,
-                              n_neighbors = 15, min_dist = 0.1,
-                              metric = "cosine", n_components = 2,
-                              verbose = FALSE, ret_model = TRUE)
-    umap_coords <- umap_model$embedding
-    label_umap_coords <- uwot::umap_transform(label_emb_pca, umap_model)
-
-    # ---- (5) HDBSCAN — the ONE step that differs across methods ---------
-    if (method == "umap_hdbscan") {
-      if (umap_subcluster == "kmeans") {
-        message(sprintf("Running k-means (k=%d) on 2D UMAP coords...", n_clusters))
-        set.seed(seed)
-        km <- kmeans(umap_coords, centers = n_clusters,
-                     nstart = 10, iter.max = 50)
-        sub_cluster_ids <- km$cluster
-        K <- n_clusters
-        message(sprintf("  Forced %d cluster(s)", K))
-      } else {
-        message(sprintf("Running HDBSCAN on 2D UMAP coords (minPts=%d)...", minPts))
-        hdb <- dbscan::hdbscan(umap_coords, minPts = minPts)
-        sub_cluster_ids <- hdb$cluster
-        K <- max(sub_cluster_ids)
-        if (K < 1) stop("HDBSCAN on UMAP coords found 0 clusters — lower minPts.")
-        message(sprintf("  Found %d UMAP cluster(s); %s subsample points are noise",
-                        K, format(sum(sub_cluster_ids == 0), big.mark = ",")))
-      }
-    } else {
-      # method == "hdbscan": run HDBSCAN on the xD PCA subsample directly.
-      message(sprintf("Running HDBSCAN on %d-D PCA subsample (minPts=%d)...",
-                      ncol(emb_sub_pca), minPts))
-      hdb <- dbscan::hdbscan(emb_sub_pca, minPts = minPts)
-      sub_cluster_ids <- hdb$cluster
-      K <- max(sub_cluster_ids)
-      if (K < 1) stop("HDBSCAN found 0 clusters — try lowering minPts.")
-      message(sprintf("  Found %d cluster(s); %s subsample regions are noise",
-                      K, format(sum(sub_cluster_ids == 0), big.mark = ",")))
-    }
-
-    # ---- (6) centroids in HD space, label by cosine to label vectors ----
-    # Centroids computed in original normalized (HD) space so cosine sim
-    # to renin_vec / non_renin_vec is meaningful (PCA-projected centroids
-    # would distort the cosine geometry).
-    centroids_hd <- vapply(seq_len(K), function(k) {
-      colMeans(emb_sub[sub_cluster_ids == k, , drop = FALSE])
-    }, numeric(ncol(emb_sub)))
-    centroids_hd <- t(centroids_hd)
-
-    centroid_norms <- sqrt(rowSums(centroids_hd * centroids_hd))
-    sims_renin <- as.numeric(centroids_hd %*% renin_vec /
-      pmax(centroid_norms * sqrt(sum(renin_vec * renin_vec)), 1e-12))
-    sims_nr <- as.numeric(centroids_hd %*% non_renin_vec /
-      pmax(centroid_norms * sqrt(sum(non_renin_vec * non_renin_vec)), 1e-12))
-
-    cos_diff <- sims_renin - sims_nr
-    cluster_to_label <- ifelse(
-      cos_diff >  margin_threshold, output_renin,
-      ifelse(cos_diff < -margin_threshold, output_non_renin, output_other)
-    )
-
-    message(sprintf("  Cluster -> label (subsample n): %s",
-      paste(sprintf("c%d=%s (n=%s, cos_r=%.2f, cos_nr=%.2f, diff=%.2f)",
-                    seq_len(K), cluster_to_label,
-                    format(tabulate(sub_cluster_ids, K), big.mark = ","),
-                    sims_renin, sims_nr, cos_diff),
-            collapse = "; ")))
-
-    # ---- (7) propagate to all 423k via k-NN majority vote in PCA space --
-    propagation_k <- 5
-    message(sprintf("Propagating to %s regions via %d-NN majority vote in %d-D PCA...",
-                    format(n_total, big.mark = ","),
-                    propagation_k, ncol(emb_sub_pca)))
-    nn <- RANN::nn2(emb_sub_pca, query = region_emb_pca_all, k = propagation_k)
-    neighbor_clusters <- matrix(sub_cluster_ids[nn$nn.idx],
-                                 nrow = n_total, ncol = propagation_k)
-    cluster_ids <- apply(neighbor_clusters, 1, function(row) {
-      tab <- tabulate(row, nbins = K)
-      which.max(tab)
-    })
-
-    # Noise (nearest subsample neighbor was HDBSCAN-noise) → fall back to
-    # per-region cosine to the two label vectors.
-    noise_mask <- cluster_ids == 0L
-    title_vec <- character(length(cluster_ids))
-    if (any(!noise_mask)) {
-      title_vec[!noise_mask] <- cluster_to_label[cluster_ids[!noise_mask]]
-    }
-    if (any(noise_mask)) {
-      title_vec[noise_mask] <- ifelse(
-        cos_renin[noise_mask] > cos_non_renin[noise_mask],
-        output_renin, output_non_renin
-      )
-    }
-
-    full_counts <- table(title_vec)
-    message(sprintf("  Full-data counts after propagation: %s (total = %s)",
-                    paste(sprintf("%s=%s", names(full_counts),
-                                  format(as.numeric(full_counts), big.mark = ",")),
-                          collapse = ", "),
-                    format(length(title_vec), big.mark = ",")))
-  }
-
-  # ---- post-hoc cosine override -----------------------------------------
-  # Two corrections, applied in order:
-  #
-  #   1. Margin band → "other": regions where |cos_renin - cos_non_renin|
-  #      is below `margin_threshold` are too ambiguous to commit to either
-  #      label. They become a third group, output_other. Set
-  #      margin_threshold = 0 to disable (gives the original binary output).
-  #
-  #   2. Flip: of the remaining "confident" regions, any whose currently-
-  #      assigned label disagrees with their cosine-nearest label get
-  #      flipped. Catches streak-tip mislabels from centroid propagation.
-  #
-  # Together these turn HDBSCAN/k-means output into a Renin / Non-renin /
-  # other partition that follows per-region cosine geometry, while keeping
-  # the original method's clustering as the "structural prior" outside the
-  # ambiguous band.
-  if (cosine_override) {
-    cos_diff <- cos_renin - cos_non_renin
-
-    n_other_added <- 0
-    if (margin_threshold > 0) {
-      ambig <- abs(cos_diff) < margin_threshold & title_vec != output_other
-      n_other_added <- sum(ambig)
-      title_vec[ambig] <- output_other
-    }
-
-    flip_to_nr <- title_vec == output_renin     & cos_diff < 0
-    flip_to_r  <- title_vec == output_non_renin & cos_diff > 0
-    n_flip <- sum(flip_to_nr) + sum(flip_to_r)
-    title_vec[flip_to_nr] <- output_non_renin
-    title_vec[flip_to_r]  <- output_renin
-
-    message(sprintf(
-      "  Post-hoc cosine override: margin=%.3f -> %s regions to '%s'; flipped %s %s<->%s pairs (%.2f%% of regions affected total)",
-      margin_threshold,
-      format(n_other_added, big.mark = ","), output_other,
-      format(n_flip,        big.mark = ","), output_renin, output_non_renin,
-      100 * (n_other_added + n_flip) / length(title_vec)
-    ))
-
-    # ---- spatial smoothing: grow "other" via k-NN propagation ----------
-    # Each region currently labeled Renin/Non-renin checks its k nearest
-    # neighbors (in PCA-reduced embedding space). If at least
-    # spatial_smooth_thresh of them are "other", this region flips to
-    # "other" too. Iterates until convergence (no new flips) or max iters.
-    # Captures the full geometric sub-cluster, including interior regions
-    # whose individual cos_diff exceeds margin_threshold.
-    if (spatial_smooth && margin_threshold > 0 &&
-        sum(title_vec == output_other) > 10) {
-      has_rann <- requireNamespace("RANN", quietly = TRUE)
-      has_fnn  <- requireNamespace("FNN",  quietly = TRUE)
-      if (!has_rann && !has_fnn) {
-        warning("spatial_smooth requires 'RANN' or 'FNN' — skipping (install.packages('RANN'))")
-      } else {
-        # PCA-reduce for fast k-NN. Three strategies, fastest first:
-        #   (a) Reuse HDBSCAN's PCA basis (free — already computed in the
-        #       hdbscan block) and project full data via matrix multiply.
-        #   (b) irlba::prcomp_irlba — partial SVD, O(n·m·k), 5-20x faster
-        #       than prcomp at this scale.
-        #   (c) prcomp fallback — full SVD, slow but available everywhere.
-        smooth_dim <- min(15, ncol(region_emb_norm))
-        if (exists("region_emb_pca_all") && exists("pca") && !is.null(pca)) {
-          # Reuse the PCA basis from the shared hdbscan/umap_hdbscan pipeline
-          # — the full-data projection is already in memory.
-          message("  Spatial smoothing: reusing pre-computed PCA basis (no recompute)")
-          coords <- region_emb_pca_all[, seq_len(min(smooth_dim,
-                                                     ncol(region_emb_pca_all))),
-                                       drop = FALSE]
-        } else if (requireNamespace("irlba", quietly = TRUE)) {
-          message("  Spatial smoothing: running irlba PCA (partial SVD)...")
-          smooth_pca <- irlba::prcomp_irlba(region_emb_norm, n = smooth_dim,
-                                             center = TRUE, scale. = FALSE)
-          coords <- smooth_pca$x
-        } else {
-          message("  Spatial smoothing: running prcomp PCA (slow — install 'irlba' for 5-20x speedup)...")
-          smooth_pca <- prcomp(region_emb_norm, center = TRUE, scale. = FALSE,
-                               rank. = smooth_dim)
-          coords <- smooth_pca$x
-        }
-        knn_backend <- if (has_rann) "RANN" else "FNN"
-        message(sprintf(
-          "  Spatial smoothing: starting at %s 'other' regions, propagating via k-NN (k=%d, thresh=%.2f, backend=%s)...",
-          format(sum(title_vec == output_other), big.mark = ","),
-          spatial_smooth_k, spatial_smooth_thresh, knn_backend
-        ))
-        n_thresh <- ceiling(spatial_smooth_k * spatial_smooth_thresh)
-
-        # RANN::nn2 is 5-10x faster than FNN at this scale. Returns same
-        # nn.idx matrix. Asking for k+1 because RANN includes the query
-        # point itself as the first neighbor — strip column 1.
-        if (has_rann) {
-          nn_raw <- RANN::nn2(coords, k = spatial_smooth_k + 1)
-          nn <- list(nn.index = nn_raw$nn.idx[, -1, drop = FALSE])
-        } else {
-          nn <- FNN::get.knn(coords, k = spatial_smooth_k)
-        }
-
-        for (iter in seq_len(spatial_smooth_max_iter)) {
-          neighbor_titles <- matrix(title_vec[nn$nn.index],
-                                     nrow = nrow(coords),
-                                     ncol = spatial_smooth_k)
-          n_other_nbrs <- rowSums(neighbor_titles == output_other)
-          new_other <- n_other_nbrs >= n_thresh & title_vec != output_other
-          n_added <- sum(new_other)
-          if (n_added == 0) {
-            message(sprintf("    iter %d: converged (no new flips)", iter))
-            break
-          }
-          title_vec[new_other] <- output_other
-          message(sprintf("    iter %d: +%s regions (total 'other' = %s)",
-                          iter, format(n_added, big.mark = ","),
-                          format(sum(title_vec == output_other),
-                                 big.mark = ",")))
-        }
-      }
-    }
-  }
-
-  # Parse "chr_start_end" -> (id, start, end). Anchor on the last two
-  # numeric blocks so chromosomes with underscores (e.g. "chr1_random") parse.
-  parsed <- str_match(region_names, "^(.+)_([0-9]+)_([0-9]+)$")
-  ok <- !is.na(parsed[, 1])
-  if (any(!ok)) {
-    warning(sprintf(
-      "%d region name(s) did not match 'chr_start_end' pattern; dropped.",
-      sum(!ok)
-    ))
-  }
-
-  result <- data.frame(
-    title = title_vec[ok],
-    id    = parsed[ok, 2],
-    start = as.integer(parsed[ok, 3]),
-    end   = as.integer(parsed[ok, 4]),
-    stringsAsFactors = FALSE
-  )
-
-  # Attach UMAP coords (subsample only) + label coords as attributes so
-  # plot_starspace_clusters can reuse them — avoids a second UMAP run with
-  # different layout. Both density-based methods now share the same UMAP
-  # pre-training step, so the saved layout is identical across them at the
-  # same (hdb_pca_dim, hdb_max_n).
-  if (method %in% c("hdbscan", "umap_hdbscan") && exists("umap_coords")) {
-    attr(result, "umap_coords")       <- umap_coords
-    attr(result, "umap_region_keys")  <- region_names[sub_idx]
-    attr(result, "umap_label_coords") <- label_umap_coords
-    attr(result, "umap_label_names")  <- gsub("^__label__", "", label_names)
-  }
-
-  result
+cluster_csv <- file.path(bed_dir, "cluster_regions.csv")
+if (!file.exists(cluster_csv)) {
+  stop(cluster_csv, " not found. Run the 'Region embedding colored by ",
+       "nearest-label cluster' section of ",
+       "src/7_Evaluating_reninness_scoring_tool.ipynb, which writes it.")
 }
+starspace_regions <- read.csv(cluster_csv, stringsAsFactors = FALSE)
+
+stopifnot(all(c("title", "id", "start", "end") %in% names(starspace_regions)))
+message(sprintf("Loaded %s regions from %s | clusters: %s",
+                format(nrow(starspace_regions), big.mark = ","), cluster_csv,
+                paste(sprintf("%s=%s", names(table(starspace_regions$title)),
+                              format(as.numeric(table(starspace_regions$title)),
+                                     big.mark = ",")),
+                      collapse = ", ")))
 ```
 
-## Generate `starspace_regions`
-
-```{r}
-starspace_regions <- cluster_starspace_regions(
-  starspace_model_path,
-  method = "hdbscan",
-  minPts = 50,
-  hdb_max_n   = 20000,
-  hdb_pca_dim = 5,
-  cosine_override         = TRUE,
-  margin_threshold        = 0.1,
-  spatial_smooth          = FALSE
-  )
-
-write.csv(
-  starspace_regions,
-  file.path(bed_dir, "cluster_regions.csv"),
-  row.names = FALSE
-)
-
-
-```
-
-## Visualize the embedding colored by cluster
-
-2D projection of the region embedding, colored by the Renin / Non-renin
-label that `cluster_starspace_regions()` assigned. The two trained label
-vectors (`__label__Renin`, `__label__Non_Renin`) are drawn as triangles
-so you can see whether each cluster sits near its named label and
-roughly how far apart the two labels ended up in embedding space.
-
-Defaults to **PCA** (instant, linear). Set `method = "umap"` for a
-non-linear UMAP projection — slower (≈30–120s on 100k regions) and needs
-`uwot` installed in your R library.
-
-```{r, fig.width = 8, fig.height = 6}
-plot_starspace_clusters <- function(model_path, starspace_regions,
-                                    method          = c("umap", "pca", "cos_axes"),
-                                    max_regions     = 5000,
-                                    n_neighbors     = 15,
-                                    min_dist        = 0.1,
-                                    color_regions   = TRUE,
-                                    alpha_renin     = 0.5,
-                                    alpha_non_renin = 0.5,
-                                    alpha_other     = 0.5,
-                                    seed            = 42,
-                                    force_refit_umap = FALSE) {
-  # force_refit_umap = TRUE → ignore any saved UMAP attrs and re-fit a
-  # fresh UMAP on `max_regions` regions sampled from the full set in raw
-  # high-D space (cosine metric, no PCA). Use this to reproduce the
-  # pre-refactor plot topology, where the clustering UMAP and the plot
-  # UMAP were independent.
-  method <- match.arg(method)
-
-  # ---- Check for saved UMAP coords from cluster_starspace_regions -------
-  # If present and method = "umap", reuse them so the plot shows exactly
-  # the layout that was clustered on. Avoids the UMAP-vs-UMAP mismatch
-  # (different subsample, different layout) that causes the appearance
-  # of "wrong color" dots at cluster tips in the plot.
-  saved_umap_coords  <- attr(starspace_regions, "umap_coords")
-  saved_region_keys  <- attr(starspace_regions, "umap_region_keys")
-  saved_label_coords <- attr(starspace_regions, "umap_label_coords")
-  saved_label_names  <- attr(starspace_regions, "umap_label_names")
-  use_saved <- method == "umap" &&
-               !force_refit_umap &&
-               !is.null(saved_umap_coords) &&
-               !is.null(saved_region_keys) &&
-               !is.null(saved_label_coords) &&
-               !is.null(saved_label_names)
-
-  if (use_saved) {
-    message("Reusing UMAP coords from cluster_starspace_regions (no UMAP re-fit)")
-
-    set.seed(seed)
-    n_regions <- nrow(saved_umap_coords)
-    idx <- if (n_regions > max_regions) sort(sample.int(n_regions, max_regions))
-           else seq_len(n_regions)
-
-    region_coords    <- saved_umap_coords[idx, , drop = FALSE]
-    region_names_sub <- saved_region_keys[idx]
-
-    ss_key          <- paste(starspace_regions$id, starspace_regions$start,
-                             starspace_regions$end, sep = "_")
-    region_to_label <- setNames(starspace_regions$title, ss_key)
-    region_labels   <- region_to_label[region_names_sub]
-
-    label_coords <- saved_label_coords
-    label_names  <- saved_label_names
-    axis_x       <- "UMAP 1"
-    axis_y       <- "UMAP 2"
-  } else {
-    # ---- Original path: parse model.tsv, subsample, run dim-reduction ----
-    # Reparse model.tsv — identify labels by "__label__" prefix, not by position.
-    embed <- read.table(model_path, sep = "\t", header = FALSE,
-                        comment.char = "", quote = "", stringsAsFactors = FALSE,
-                        fill = TRUE)
-    embed <- embed[!is.na(embed[, 1]) & embed[, 1] != "", , drop = FALSE]
-    is_label    <- grepl("^__label__", embed[, 1])
-    label_rows  <- embed[ is_label, , drop = FALSE]
-    region_rows <- embed[!is_label, , drop = FALSE]
-
-    region_emb   <- as.matrix(region_rows[, -1]); storage.mode(region_emb) <- "double"
-    label_emb    <- as.matrix(label_rows[,  -1]); storage.mode(label_emb)  <- "double"
-    region_names <- region_rows[, 1]
-    label_names  <- gsub("^__label__", "", label_rows[, 1])
-
-    # Subsample to max_regions (matches geniml's create_umap_visualization()
-    # default of 5000). UMAP at 5k is ~10s; at 50k it can take minutes.
-    set.seed(seed)
-    n_regions <- nrow(region_emb)
-    idx <- if (n_regions > max_regions) sort(sample.int(n_regions, max_regions))
-           else seq_len(n_regions)
-    region_emb_sub   <- region_emb[idx, ]
-    region_names_sub <- region_names[idx]
-
-    # Per-region cluster label from starspace_regions, joined by "chr_start_end".
-    ss_key          <- paste(starspace_regions$id, starspace_regions$start,
-                             starspace_regions$end, sep = "_")
-    region_to_label <- setNames(starspace_regions$title, ss_key)
-    region_labels   <- region_to_label[region_names_sub]
-
-    # Joint dim-reduction so region points and label triangles end up in
-    # the same coordinate system.
-    combined <- rbind(region_emb_sub, label_emb)
-    if (method == "umap") {
-      if (!requireNamespace("uwot", quietly = TRUE)) {
-        stop("Install 'uwot' for UMAP: install.packages('uwot', lib = .libPaths()[1])")
-      }
-      message(sprintf("Running UMAP on %s points (n_neighbors=%d, min_dist=%.2f, cosine)...",
-                      format(nrow(combined), big.mark = ","), n_neighbors, min_dist))
-      coords <- uwot::umap(combined,
-                           n_neighbors = min(n_neighbors, nrow(combined) - 1),
-                           min_dist    = min_dist,
-                           metric      = "cosine",
-                           n_components = 2,
-                           verbose     = TRUE)
-      axis_x <- "UMAP 1"; axis_y <- "UMAP 2"
-    } else if (method == "pca") {
-      pc     <- prcomp(combined, scale. = FALSE)
-      coords <- pc$x[, 1:2]
-      axis_x <- "PC1"; axis_y <- "PC2"
-    } else if (method == "cos_axes") {
-      renin_idx     <- which(label_names == "Renin")
-      non_renin_idx <- which(label_names == "Non_Renin")
-      if (length(renin_idx) != 1 || length(non_renin_idx) != 1) {
-        stop("cos_axes needs both 'Renin' and 'Non_Renin' label rows in model.tsv.")
-      }
-      cs <- function(M, v) {
-        n <- sqrt(rowSums(M * M)) * sqrt(sum(v * v))
-        as.numeric((M %*% v) / pmax(n, 1e-12))
-      }
-      coords <- cbind(
-        cs(combined, label_emb[renin_idx,     ]),
-        cs(combined, label_emb[non_renin_idx, ])
-      )
-      axis_x <- "cos sim to Renin label"
-      axis_y <- "cos sim to Non-renin label"
-    }
-
-    # Split coordinates back out (matches geniml's split: region_coords first,
-    # label_coords second).
-    region_coords <- coords[seq_along(idx), , drop = FALSE]
-    label_coords  <- coords[(length(idx) + 1):nrow(coords), , drop = FALSE]
-  }
-
-  region_df <- data.frame(
-    x       = region_coords[, 1],
-    y       = region_coords[, 2],
-    cluster = region_labels,
-    stringsAsFactors = FALSE
-  )
-  label_df <- data.frame(
-    x     = label_coords[, 1],
-    y     = label_coords[, 2],
-    name  = label_names,
-    stringsAsFactors = FALSE
-  )
-
-  # geniml's label palette: darkorange for Renin, royalblue for Non_Renin.
-  label_palette <- vapply(label_df$name, function(n) {
-    nl <- tolower(n)
-    if (nl == "renin")                              "darkorange"
-    else if (grepl("non", nl) && grepl("renin", nl)) "royalblue"
-    else                                            "grey40"
-  }, character(1))
-  names(label_palette) <- label_df$name
-
-  cluster_palette <- c(Renin = "darkorange", `Non-renin` = "royalblue",
-                       other = "grey60")
-
-  # Region layers: split by cluster so each color has its own alpha.
-  # Setting alpha_renin = 0 hides orange points to reveal blue dots that
-  # might be underneath (and vice versa). When color_regions = FALSE, all
-  # regions render uniform grey at alpha_other (geniml's style).
-  rasterise_if_avail <- function(layer) {
-    if (requireNamespace("ggrastr", quietly = TRUE))
-      ggrastr::rasterise(layer, dpi = 200) else layer
-  }
-
-  region_layers <- if (color_regions) {
-    df_r  <- region_df[region_df$cluster == "Renin",     ]
-    df_nr <- region_df[region_df$cluster == "Non-renin", ]
-    df_o  <- region_df[!region_df$cluster %in% c("Renin", "Non-renin"), ]
-    list(
-      rasterise_if_avail(
-        geom_point(data = df_nr, aes(x, y, colour = cluster),
-                   size = 1, alpha = alpha_non_renin)),
-      rasterise_if_avail(
-        geom_point(data = df_o, aes(x, y, colour = cluster),
-                   size = 1, alpha = alpha_other)),
-      rasterise_if_avail(
-        geom_point(data = df_r, aes(x, y, colour = cluster),
-                   size = 1, alpha = alpha_renin))
-      # Order: blue first, then other, then orange on top — so when both
-      # alphas are non-zero, the minority color (usually orange Renin
-      # cluster) is visible above the dense blue background.
-    )
-  } else {
-    list(rasterise_if_avail(
-      geom_point(data = region_df, aes(x, y),
-                 colour = "lightgrey", size = 1, alpha = alpha_other)))
-  }
-
-  ggplot() +
-    region_layers +
-    geom_point(data = label_df, aes(x, y, fill = name),
-               size = 6, shape = 24, colour = "black", stroke = 1.5,
-               show.legend = TRUE) +
-    geom_text(data = label_df, aes(x, y, label = name),
-              hjust = -0.15, vjust = -0.3,
-              fontface = "bold", size = 4, colour = "black") +
-    scale_colour_manual(values = cluster_palette, name = "k-means cluster") +
-    scale_fill_manual(values   = label_palette,   name = "Label embedding") +
-    labs(title    = sprintf("StarSpace embedding — %s",
-                            switch(method,
-                                   pca      = "PCA",
-                                   umap     = "UMAP (n_neighbors=15, min_dist=0.1, cosine)",
-                                   cos_axes = "cos-sim to label vectors")),
-         subtitle = sprintf("n = %s of %s regions",
-                            format(length(idx), big.mark = ","),
-                            format(n_regions,   big.mark = ",")),
-         x        = axis_x,
-         y        = axis_y) +
-    theme_bw(base_size = 12) +
-    theme(panel.grid.minor = element_blank(),
-          legend.position  = "right")
-}
-```
-
-```{r}
-p_embed_clusters <- plot_starspace_clusters(starspace_model_path,
-                                            starspace_regions,
-                                            method        = "umap",
-                                            max_regions   = 5000,
-                                            n_neighbors   = 15,
-                                            min_dist      = 0.1,
-                                            alpha_renin     = 0.3,
-                                            alpha_non_renin = 0.3,
-                                            alpha_other     = 0.3,
-                                            color_regions = TRUE,
-                                            force_refit_umap = TRUE)
-
-ggsave(file.path("plot", "starspace_embedding_clusters_force_refit.svg"),
-       p_embed_clusters, width = 10, height = 8, units = "in", dpi = 200)
-
-p_embed_clusters <- plot_starspace_clusters(starspace_model_path,
-                                            starspace_regions,
-                                            method        = "umap",
-                                            max_regions   = 5000,
-                                            n_neighbors   = 15,
-                                            min_dist      = 0.1,
-                                            alpha_renin     = 0.3,
-                                            alpha_non_renin = 0.3,
-                                            alpha_other     = 0.3,
-                                            color_regions = TRUE,
-                                            force_refit_umap = FALSE)
-
-ggsave(file.path("plot", "starspace_embedding_clusters.svg"),
-       p_embed_clusters, width = 10, height = 8, units = "in", dpi = 200)
-```
 
 # 8c. Process DESeq2 differential regions
 
@@ -945,11 +150,11 @@ primary_normal <- subset(primary_normal, pvalue < fdr)
 primary_normal_up <- subset(primary_normal, log2FoldChange >=  absFoldChange)
 primary_normal_down <- subset(primary_normal, log2FoldChange <= -absFoldChange)
 
-primary_high <- subset(primary_high, padj < fdr)
+primary_high <- subset(primary_high, pvalue < fdr)
 primary_high_up <- subset(primary_high, log2FoldChange >=  absFoldChange)
 primary_high_down <- subset(primary_high, log2FoldChange <= -absFoldChange)
 
-as_normal <- subset(as_normal, padj < fdr)
+as_normal <- subset(as_normal, pvalue < fdr)
 as_normal_up <- subset(as_normal, log2FoldChange >=  absFoldChange)
 as_normal_down <- subset(as_normal, log2FoldChange <= -absFoldChange)
 ```
@@ -969,8 +174,11 @@ lst_down <- list(
   paste(as.data.frame(primary_high_down)$seqnames,   as.data.frame(primary_high_down)$start,   as.data.frame(primary_high_down)$end,   sep = "_")
 )
 
-counts_up   <- table(unlist(lst_up))
-counts_down <- table(unlist(lst_down))
+# Count DISTINCT contrasts per region, matching venn()/fromList() in
+# 3_plot_genomic_distributions.Rmd: a key duplicated inside one contrast must
+# not reach 2 on its own.
+counts_up   <- table(unlist(lapply(lst_up,   unique)))
+counts_down <- table(unlist(lapply(lst_down, unique)))
 
 inc <- names(counts_up)  [counts_up   >= 2]
 dec <- names(counts_down)[counts_down >= 2]
@@ -981,35 +189,59 @@ dec <- names(counts_down)[counts_down >= 2]
 
 ## Build region categories
 
-StarSpace clusters (`r`, `nr`) + DESeq2 calls (`inc`, `dec`, `nd`). `nd`
-is just `universe - inc - dec`, drawn from the BED loaded in 8c.
+One region-key set per trained StarSpace label + DESeq2 calls (`inc`,
+`dec`, `nd`). `nd` is just `universe - inc - dec`, drawn from the BED
+loaded in 8c.
+
+`r` is the focal cluster (`focus_label`) and `nr` pools every other
+label, which is what keeps the rest of the document a two-sided
+renin-vs-rest comparison however many labels the model was trained with.
+The ambiguous `other` band that `margin_threshold` can produce is a
+non-answer, not a cluster, so it is excluded from `nr` rather than
+pooled into it.
 
 ```{r}
-ss_up   <- subset(starspace_regions, title == "Renin")
-ss_down <- subset(starspace_regions, title == "Non-renin")
+ss_key  <- paste(starspace_regions$id, starspace_regions$start,
+                 starspace_regions$end, sep = "_")
+ss_sets <- split(ss_key, factor(starspace_regions$title,
+                                levels = unique(starspace_regions$title)))
 
-r  <- paste(ss_up$id,   ss_up$start,   ss_up$end,   sep = "_")
-nr <- paste(ss_down$id, ss_down$start, ss_down$end, sep = "_")
+ambiguous_label <- "other"   # the notebook's margin band, if it was used
+cluster_labels  <- setdiff(names(ss_sets), ambiguous_label)
+stopifnot(focus_label %in% cluster_labels)
+# Focus first, so set order in the UpSet plot and in `sets` below is stable
+# across models rather than following model.tsv's vocabulary order.
+cluster_labels  <- c(focus_label, setdiff(cluster_labels, focus_label))
 
-nd <- setdiff(c(r, nr), c(inc, dec)) 
+r  <- ss_sets[[focus_label]]
+nr <- unlist(ss_sets[setdiff(cluster_labels, focus_label)], use.names = FALSE)
+
+nd <- setdiff(c(r, nr), c(inc, dec))
+
+message(sprintf("StarSpace clusters: %s | pooled non-%s = %s",
+                paste(sprintf("%s=%s", names(ss_sets),
+                              format(lengths(ss_sets), big.mark = ",")),
+                      collapse = ", "),
+                focus_label, format(length(nr), big.mark = ",")))
 ```
 
 ## UpSet plot
 
 ```{r}
-listInput_all <- list(
-  Increase         = inc,
-  Decrease         = dec,
-  Non_differential = nd,
-  Renin            = r,
-  Non_renin        = nr
-)
+# UpSetR's fromList() runs the names through data.frame(), which would
+# mangle "Non-renin" into "Non.renin" and break the `sets =` lookup below.
+# Slugging to "Non_renin" here reproduces the historical 2-label naming.
+disp        <- gsub("[^A-Za-z0-9]+", "_", cluster_labels)
+focus_disp  <- gsub("[^A-Za-z0-9]+", "_", focus_label)
+deseq_sets  <- list(Increase = inc, Decrease = dec, Non_differential = nd)
+
+listInput_all <- c(deseq_sets, setNames(ss_sets[cluster_labels], disp))
 
 svg(file.path(plot_dir, "ss_deseq_upset.svg"), width = 10, height = 6, onefile = FALSE)
 upset(fromList(listInput_all),
       mainbar.y.label = "overlapped regions",
       sets.x.label = "regions per group",
-      sets = c("Increase", "Decrease", "Non_differential", "Renin", "Non_renin"),
+      sets = c(names(deseq_sets), disp),
       keep.order = TRUE, order.by = "freq",
       show.numbers = "yes",
       set_size.show = TRUE,
@@ -1017,14 +249,20 @@ upset(fromList(listInput_all),
       text.scale = c(1.5,1.5,1.5,1.5,1.75,1.5))
 dev.off()
 
-sets <- list(
-  `Increase:Renin`             = intersect(inc, r),
-  `Increase:Non_renin`         = intersect(inc, nr),
-  `Decrease:Renin`             = intersect(dec, r),
-  `Decrease:Non_renin`         = intersect(dec, nr),
-  `Non_differential:Renin`     = intersect(nd, r),
-  `Non_differential:Non_renin` = intersect(nd, nr)
-)
+# Every DESeq2 call x every StarSpace label. With 3+ labels the pooled
+# "non-<focus>" complement is appended as well, since it is the set the
+# tornado / GO steps downstream actually consume; with 2 labels the single
+# other label already IS that complement, so it is not duplicated.
+sets <- list()
+for (d in names(deseq_sets)) {
+  for (i in seq_along(cluster_labels)) {
+    sets[[paste0(d, ":", disp[i])]] <-
+      intersect(deseq_sets[[d]], ss_sets[[cluster_labels[i]]])
+  }
+  if (length(cluster_labels) > 2) {
+    sets[[paste0(d, ":non_", focus_disp)]] <- intersect(deseq_sets[[d]], nr)
+  }
+}
 lengths(sets)
 ```
 
@@ -1041,12 +279,52 @@ write_set_bed <- function(peaks, out_path) {
   GenomicRanges::makeGRangesFromDataFrame(df)
 }
 
-nd_r  <- write_set_bed(sets$`Non_differential:Renin`,    file.path(bed_dir, "nd_r.bed"))
-nd_nr <- write_set_bed(sets$`Non_differential:Non_renin`,file.path(bed_dir, "nd_nr.bed"))
-inc_r <- write_set_bed(sets$`Increase:Renin`,            file.path(bed_dir, "inc_r.bed"))
-inc_nr<- write_set_bed(sets$`Increase:Non_renin`,        file.path(bed_dir, "inc_nr.bed"))
-dec_r <- write_set_bed(sets$`Decrease:Renin`,            file.path(bed_dir, "dec_r.bed"))
-dec_nr<- write_set_bed(sets$`Decrease:Non_renin`,        file.path(bed_dir, "dec_nr.bed"))
+# Filename convention, unchanged for 2-label models: the focal cluster is
+# "_r" and the pooled complement is "_nr", giving exactly the historical six
+# (inc_r, inc_nr, dec_r, dec_nr, nd_r, nd_nr) that 8g reloads and 8j reuses.
+# With 3+ labels each individual non-focal label additionally gets its own
+# file (inc_control.bed, inc_tumoral.bed, ...) next to the pooled "_nr" one.
+bed_prefix <- c(Increase = "inc", Decrease = "dec", Non_differential = "nd")
+bed_suffix <- function(label_part) {
+  if (label_part == focus_disp)                            "r"
+  else if (label_part == paste0("non_", focus_disp))       "nr"
+  else if (length(cluster_labels) == 2)                    "nr"
+  else                                        tolower(label_part)
+}
+
+gr_sets <- list()
+for (nm in names(sets)) {
+  parts <- strsplit(nm, ":", fixed = TRUE)[[1]]
+  var   <- paste(bed_prefix[[parts[1]]], bed_suffix(parts[2]), sep = "_")
+  gr_sets[[var]] <- write_set_bed(sets[[nm]],
+                                  file.path(bed_dir, paste0(var, ".bed")))
+  message(sprintf("  %-16s -> %-14s %s regions", nm, paste0(var, ".bed"),
+                  format(length(sets[[nm]]), big.mark = ",")))
+}
+
+# Named variables the rest of the document (8g-8j) refers to directly.
+#
+# Every set written above is bound to a variable, not just the pooled six.
+# With a 3-label model that is the full 3 x 3 grid -- inc_r/inc_control/
+# inc_tumoral, dec_*, nd_* -- plus the pooled inc_nr/dec_nr/nd_nr that 8j
+# still consumes. 8g-8i treat Control and Tumoral as SEPARATE feature sets,
+# so binding only the pooled names here (as this chunk used to) left the
+# in-memory path out of sync with the reload path in 8g.
+#
+# Short aliases mirror the reload block in 8g: _c = Control, _t = Tumoral.
+for (v in names(gr_sets)) assign(v, gr_sets[[v]])
+
+alias <- c(control = "c", tumoral = "t")
+for (cat in c("inc", "dec", "nd")) {
+  for (long in names(alias)) {
+    from <- paste(cat, long, sep = "_")
+    if (!is.null(gr_sets[[from]]))
+      assign(paste(cat, alias[[long]], sep = "_"), gr_sets[[from]])
+  }
+}
+
+message("Bound ", length(gr_sets), " set variables: ",
+        paste(sort(names(gr_sets)), collapse = ", "))
 ```
 
 # 8f. StarSpace embedding vs DESeq2 differential accessibility
@@ -1062,27 +340,60 @@ are available to inform tornado feature-set selection downstream.
     accessibility," cos-sim should track log2FC; per-facet Spearman ρ
     quantifies that.
 2.  **Binned line plot** — % of regions called differential by DESeq2 as
-    a function of cos-sim, in quantile bins. A clean knee identifies a
-    cos-sim threshold for defining renin-specific regions without
-    relying on the DESeq2 FDR/log2FC cutoff. Pooled-across-contrasts and
-    per-contrast views are both produced.
+    a function of cos-sim, in quantile bins. This is the figure that
+    shows how the DESeq2 call rate rises with embedding proximity.
+    Pooled-across-contrasts and per-contrast views are both produced.
+    It is read, not thresholded: nothing downstream cuts regions at a
+    cos-sim value.
 
 Cost: cos-sim is one matrix–vector product (O(n·d), \<1 s for n=10⁶,
 d=50). The bottleneck is re-reading the three DESeq2 CSVs (8c
 subset-overwrote the unfiltered objects). The merged region-level table
 is built once and reused for both panels.
 
-## Read embeddings, compute cos-sim to the Renin label
+## Read embeddings, compute cos-sim to every label
 
 ```{r}
-read_starspace_embeddings <- function(model_path) {
-  embed <- read.table(model_path, sep = "\t", header = FALSE, skip = 1,
-                      comment.char = "", quote = "", stringsAsFactors = FALSE,
-                      fill = TRUE)
+read_starspace_embeddings <- function(model_path, n_labels) {
+  # StarSpace's model.tsv is one row per token, no header:
+  #   <token>\t<v1>\t...\t<vd>
+  # The trained label embeddings are written as the LAST n_labels rows, so
+  # n_labels is the single knob that adapts every downstream step to a
+  # 2-label model (Renin / Non_Renin) or a 3-label one
+  # (Control / Tumoral / Renin).
+  #
+  # fread is ~10x faster than read.table on the 200 MB+ files this produces.
+  if (requireNamespace("data.table", quietly = TRUE)) {
+    embed <- data.table::fread(model_path, sep = "\t", header = FALSE,
+                               showProgress = FALSE, data.table = FALSE)
+  } else {
+    embed <- read.table(model_path, sep = "\t", header = FALSE,
+                        comment.char = "", quote = "",
+                        stringsAsFactors = FALSE, fill = TRUE)
+  }
   embed <- embed[!is.na(embed[, 1]) & embed[, 1] != "", , drop = FALSE]
-  n_rows      <- nrow(embed)
-  region_rows <- embed[1:(n_rows - 2), , drop = FALSE]
-  label_rows  <- embed[(n_rows - 1):n_rows, , drop = FALSE]
+
+  n_row <- nrow(embed)
+  if (n_labels < 2 || n_labels >= n_row) {
+    stop(sprintf("n_labels = %s is not usable with %s rows in model.tsv.",
+                 n_labels, format(n_row, big.mark = ",")))
+  }
+  label_idx   <- seq.int(n_row - n_labels + 1L, n_row)
+  label_rows  <- embed[ label_idx, , drop = FALSE]
+  region_rows <- embed[-label_idx, , drop = FALSE]
+
+  # Positional split, verified by the "__label__" prefix: if the model was
+  # trained with a different number of classes than n_labels claims, fail
+  # here rather than silently treating a region vector as a label.
+  if (!all(grepl("^__label__", label_rows[, 1]))) {
+    stop(sprintf(
+      "The last %d row(s) of model.tsv are not all '__label__' rows (got: %s). Set n_labels to the number of trained classes.",
+      n_labels, paste(label_rows[, 1], collapse = ", ")))
+  }
+  if (any(grepl("^__label__", region_rows[, 1]))) {
+    stop(sprintf(
+      "model.tsv holds more than %d '__label__' rows; raise n_labels.", n_labels))
+  }
 
   region_emb <- as.matrix(region_rows[, -1]); storage.mode(region_emb) <- "double"
   label_emb  <- as.matrix(label_rows[,  -1]); storage.mode(label_emb)  <- "double"
@@ -1095,21 +406,37 @@ read_starspace_embeddings <- function(model_path) {
   )
 }
 
-emb           <- read_starspace_embeddings(starspace_model_path)
-renin_idx     <- which(emb$label_names == "Renin")
-non_renin_idx <- which(emb$label_names == "Non_Renin")
-stopifnot(length(renin_idx) == 1, length(non_renin_idx) == 1)
-renin_vec     <- emb$label_emb[renin_idx, ]
-non_renin_vec <- emb$label_emb[non_renin_idx, ]
+# Row-wise L2 normalization — shared by every cosine computation below.
+unit_rows <- function(M) {
+  u <- M / pmax(sqrt(rowSums(M * M)), 1e-12)
+  u[!is.finite(u)] <- 0
+  u
+}
 
-# Cosine sim of every region row to each label vector. One BLAS call each.
-region_norms   <- sqrt(rowSums(emb$region_emb * emb$region_emb))
-renin_norm     <- sqrt(sum(renin_vec * renin_vec))
-non_renin_norm <- sqrt(sum(non_renin_vec * non_renin_vec))
-cos_renin      <- as.numeric((emb$region_emb %*% renin_vec) /
-                             (region_norms * renin_norm))
-cos_non_renin  <- as.numeric((emb$region_emb %*% non_renin_vec) /
-                             (region_norms * non_renin_norm))
+emb <- read_starspace_embeddings(starspace_model_path, n_starspace_labels)
+
+# Cosine sim of every region to every label — one BLAS call, n_regions x n_labels.
+cos_mat <- unit_rows(emb$region_emb) %*% t(unit_rows(emb$label_emb))
+colnames(cos_mat) <- emb$label_names
+stopifnot(focus_label %in% colnames(cos_mat))
+
+# Everything from here to 8j is written around a focal label and its
+# complement:
+#   cos_renin     = cos sim to focus_label
+#   cos_non_renin = the region's BEST cos sim among all the other labels, i.e.
+#                   "how strongly does this region belong to something that is
+#                   not focus_label".
+# With 2 labels cos_non_renin is exactly the old cos sim to __label__Non_Renin.
+# With 3 it pools Control and Tumoral, which keeps the downstream top-N
+# and GO steps a two-sided renin-vs-rest comparison. The per-label columns
+# are carried alongside so a specific label can be inspected directly.
+other_labels <- setdiff(colnames(cos_mat), focus_label)
+cos_renin     <- as.numeric(cos_mat[, focus_label])
+cos_non_renin <- if (length(other_labels) == 1) {
+  as.numeric(cos_mat[, other_labels])
+} else {
+  do.call(pmax, as.data.frame(cos_mat[, other_labels, drop = FALSE]))
+}
 
 emb_df <- data.frame(
   region        = emb$region_names,
@@ -1117,24 +444,24 @@ emb_df <- data.frame(
   cos_non_renin = cos_non_renin,
   stringsAsFactors = FALSE
 )
+for (lb in colnames(cos_mat)) {
+  emb_df[[paste0("cos_", gsub("[^A-Za-z0-9]+", "_", lb))]] <- as.numeric(cos_mat[, lb])
+}
 ```
 
-## Join with the 8b k-means cluster labels
+## Join with the 8b cluster labels
 
 ```{r}
-cluster_csv <- file.path(bed_dir, "cluster_regions_2.csv")
-if (file.exists(cluster_csv)) {
-  starspace_regions <- read.csv(cluster_csv, stringsAsFactors = FALSE)
-  message("Loaded cached starspace_regions from ", cluster_csv,
-          " (", nrow(starspace_regions), " regions)")
-} else {
-  if (!exists("cluster_starspace_regions")) {
-    stop("cluster_regions.csv not found and cluster_starspace_regions() ",
-         "is not defined. Run 8b first (or source its function chunk).")
+# 8b loaded starspace_regions from bed/cluster_regions.csv; re-read it here
+# so 8f can be run on its own without re-running 8b.
+if (!exists("starspace_regions")) {
+  cluster_csv <- file.path(bed_dir, "cluster_regions.csv")
+  if (!file.exists(cluster_csv)) {
+    stop(cluster_csv, " not found — run 8b (or the clustering section of ",
+         "src/7_Evaluating_reninness_scoring_tool.ipynb that writes it).")
   }
-  starspace_regions <- cluster_starspace_regions(starspace_model_path)
-  write.csv(starspace_regions, cluster_csv, row.names = FALSE)
-  message("Recomputed and cached starspace_regions to ", cluster_csv,
+  starspace_regions <- read.csv(cluster_csv, stringsAsFactors = FALSE)
+  message("Loaded starspace_regions from ", cluster_csv,
           " (", nrow(starspace_regions), " regions)")
 }
 
@@ -1166,13 +493,14 @@ dq_pn <- read_deseq(primary_normal_file); dq_pn$contrast <- "primary_normal"
 dq_ph <- read_deseq(primary_high_file);   dq_ph$contrast <- "primary_high"
 dq_an <- read_deseq(as_normal_file);      dq_an$contrast <- "as_normal"
 
-# Per-contrast differential flag — same filter logic as 8c (primary_normal
-# uses raw pvalue; the other two use padj).
+# Per-contrast differential flag — same filter logic as 8c: raw pvalue for
+# all three contrasts, matching filterRegions() in
+# 3_plot_genomic_distributions.Rmd.
 dq_pn$is_diff <- !is.na(dq_pn$pvalue) & dq_pn$pvalue < fdr &
                  abs(dq_pn$log2FoldChange) >= absFoldChange
-dq_ph$is_diff <- !is.na(dq_ph$padj)   & dq_ph$padj   < fdr &
+dq_ph$is_diff <- !is.na(dq_ph$pvalue) & dq_ph$pvalue < fdr &
                  abs(dq_ph$log2FoldChange) >= absFoldChange
-dq_an$is_diff <- !is.na(dq_an$padj)   & dq_an$padj   < fdr &
+dq_an$is_diff <- !is.na(dq_an$pvalue) & dq_an$pvalue < fdr &
                  abs(dq_an$log2FoldChange) >= absFoldChange
 
 keep_cols   <- c("region", "log2FoldChange", "contrast", "is_diff")
@@ -1275,13 +603,17 @@ ggsave(file.path(plot_dir, "starspace_cos_vs_log2fc.svg"),
 
 ## (2) P(differential) vs cosine similarity — binned line plot
 
-Replaces the cluster stacked bar. The k-means split is a hard binary cut
+Replaces the cluster stacked bar. The nearest-label split is a hard cut
 that throws away the continuous cos-sim information, which is precisely
 what we want to inspect here. Binning regions by cos-sim quantile and
 plotting the per-bin DE rate directly shows whether embedding distance
-and DESeq2 calls co-vary smoothly (linear slope → no natural cutoff,
-keep using DESeq2 FDR/log2FC) or whether there's a knee where DE rate
-drops sharply (use cos-sim as the threshold instead).
+and DESeq2 calls co-vary — a rising curve means regions the embedding
+places nearer the label are more often called differential.
+
+This is a **descriptive** figure. Region sets are defined by the DESeq2
+call and ranked by cosine (8g); nothing is cut at a cos-sim value, so
+the curve can be read as evidence rather than as the thing that produced
+the sets.
 
 Bin edges come from quantiles of the full pooled cos-sim distribution,
 so the same edges apply to every panel — the averaged and faceted views
@@ -1290,26 +622,48 @@ are directly comparable.
 ```{r}
 plot_pde_vs_cos <- function(df,
                             facet_by_contrast = TRUE,
-                            n_bins = 20) {
-  # Bin edges from quantiles of the full cos_renin distribution. Applying
-  # the same edges to every contrast (and to the pooled "avg" view) keeps
-  # panels directly comparable.
-  brks <- quantile(df$cos_renin,
-                   probs = seq(0, 1, length.out = n_bins + 1),
-                   na.rm = TRUE)
-  df$cos_bin <- cut(df$cos_renin, breaks = brks, include.lowest = TRUE)
+                            n_bins = 20,
+                            label_cols = NULL) {
+  # ONE ROW PER LABEL (2026-09-06). `label_cols` is a named vector: the name
+  # is the row strip, the value is that label's cosine column in `df`
+  # (`cos_Renin`, `cos_Control`, `cos_Tumoral` -- written by the emb_df loop
+  # in 8f). NULL keeps the historical single-row, Renin-only figure, so the
+  # (2a) dual-axis caller and any older call site are unchanged.
+  #
+  # WHY EACH ROW GETS ITS OWN BIN EDGES. Edges are quantiles of that label's
+  # OWN cosine distribution. Binning the Control row on Renin quantiles would
+  # put most of its regions in one or two bins -- the three labels do not
+  # share a cosine scale. The comparability the single-row version had
+  # (same edges across contrast panels) is preserved WITHIN each row, which
+  # is the comparison the figure is actually read for.
+  if (is.null(label_cols)) label_cols <- c(Renin = "cos_renin")
+  missing_cols <- setdiff(unname(label_cols), names(df))
+  if (length(missing_cols))
+    stop("plot_pde_vs_cos: column(s) not in df: ",
+         paste(missing_cols, collapse = ", "))
 
-  group_cols <- if (facet_by_contrast) c("contrast", "cos_bin") else "cos_bin"
+  bin_one <- function(lab_name, cos_col) {
+    x <- df[[cos_col]]
+    brks <- quantile(x, probs = seq(0, 1, length.out = n_bins + 1),
+                     na.rm = TRUE)
+    d <- df
+    d$cos_val <- x
+    d$cos_bin <- cut(x, breaks = brks, include.lowest = TRUE)
+    group_cols <- if (facet_by_contrast) c("contrast", "cos_bin") else "cos_bin"
+    d %>%
+      group_by(across(all_of(group_cols))) %>%
+      summarise(
+        n       = n(),
+        cos_mid = median(cos_val),
+        pct_inc = 100 * mean(is_diff & log2FoldChange > 0),
+        pct_dec = 100 * mean(is_diff & log2FoldChange < 0),
+        .groups = "drop"
+      ) %>%
+      mutate(label = lab_name)
+  }
 
-  bin_summary <- df %>%
-    group_by(across(all_of(group_cols))) %>%
-    summarise(
-      n       = n(),
-      cos_mid = median(cos_renin),
-      pct_inc = 100 * mean(is_diff & log2FoldChange > 0),
-      pct_dec = 100 * mean(is_diff & log2FoldChange < 0),
-      .groups = "drop"
-    ) %>%
+  bin_summary <- purrr::imap_dfr(label_cols, ~ bin_one(.y, .x)) %>%
+    mutate(label = factor(label, levels = names(label_cols))) %>%
     tidyr::pivot_longer(c(pct_inc, pct_dec),
                         names_to  = "direction",
                         values_to = "pct") %>%
@@ -1317,29 +671,37 @@ plot_pde_vs_cos <- function(df,
                               pct_inc = "Increase",
                               pct_dec = "Decrease"))
 
+  multi <- length(label_cols) > 1
   p <- ggplot(bin_summary, aes(cos_mid, pct, colour = direction)) +
     geom_line(linewidth = 0.8) +
     geom_point(size = 1.5) +
     scale_colour_manual(values = c(Increase = "#FF7F0E", Decrease = "#1F77B4"),
                         name = "DESeq2 direction") +
-    labs(x = "cosine similarity to Renin label (bin median)",
+    labs(x = if (multi) "cosine similarity to the row's label (bin median)"
+             else "cosine similarity to Renin label (bin median)",
          y = "% of regions called differential",
          caption = sprintf(
-           "Quantile-binned, %d bins, n_rows = %s%s",
+           "Quantile-binned within each row, %d bins, n_rows = %s%s",
            n_bins, format(nrow(df), big.mark = ","),
            if (facet_by_contrast) " (per-contrast)" else " (pooled across contrasts)"
          )) +
     theme_bw(base_size = 11) +
     theme(panel.grid.minor = element_blank())
 
-  if (facet_by_contrast) {
+  # free x: each label's cosine occupies a different range, so a shared axis
+  # would compress two of the three rows into a sliver
+  if (multi && facet_by_contrast) {
+    p <- p + facet_grid(label ~ contrast, scales = "free_x")
+  } else if (multi) {
+    p <- p + facet_wrap(~ label, scales = "free_x")
+  } else if (facet_by_contrast) {
     p <- p + facet_wrap(~ contrast)
   }
   p
 }
 ```
 
-### (2a) Pooled across contrasts — dual-axis with knee detection
+### (2a) Pooled across contrasts — dual axis
 
 Each direction gets its own cos-sim axis:
 
@@ -1353,17 +715,8 @@ either way), they just measure distance to different label vectors. The
 two binnings are independent — each line is in its own native axis
 space.
 
-Dashed vertical lines mark the **knee** for each direction: the smallest
-cos-sim at which the per-bin DE rate first crosses `de_threshold_pct`.
-Those two thresholds are returned in the result and reused in 8g–8i to
-subset the tornado feature sets.
-
 ```{r, fig.width = 7, fig.height = 4.5}
-plot_pde_vs_cos_dual_axis <- function(df,
-                                      n_bins           = 20,
-                                      knee_method      = c("kneedle", "abs"),
-                                      de_threshold_pct = 50) {
-  knee_method <- match.arg(knee_method)
+plot_pde_vs_cos_dual_axis <- function(df, n_bins = 20) {
   # ---- bin Increase by cos_renin ----
   brks_r <- quantile(df$cos_renin,
                      probs = seq(0, 1, length.out = n_bins + 1),
@@ -1396,61 +749,9 @@ plot_pde_vs_cos_dual_axis <- function(df,
   ) %>%
     mutate(direction = factor(direction, levels = c("Increase", "Decrease")))
 
-  # ---- knee detection ----
-  # Two methods, controlled by `knee_method`:
-  #
-  # "kneedle" (default) — finds the point where the curve STARTS rising
-  #   exponentially. For a convex-increasing curve (flat tail → steep
-  #   rise), the data sits BELOW the chord from first to last bin. The
-  #   knee is the point of maximum downward deviation from that chord
-  #   (after normalising x and y to [0, 1]). This catches the inflection
-  #   where %DE first lifts off background, not where it has already
-  #   climbed past some absolute level.
-  #
-  # "abs" — fallback: smallest cos_mid where per-bin pct first crosses
-  #   `de_threshold_pct`. Use this if the curve is roughly linear and
-  #   Kneedle is picking a degenerate point.
-  detect_knee <- function(bd) {
-    bd <- bd %>% arrange(cos_mid) %>% dplyr::filter(!is.na(pct))
-    if (nrow(bd) < 3) return(NA_real_)
-
-    if (knee_method == "kneedle") {
-      x_range <- range(bd$cos_mid)
-      y_range <- range(bd$pct)
-      if (diff(x_range) == 0 || diff(y_range) == 0) return(NA_real_)
-      xn <- (bd$cos_mid - x_range[1]) / diff(x_range)
-      yn <- (bd$pct    - y_range[1]) / diff(y_range)
-      # Max downward deviation from chord (0,0) → (1,1).
-      return(bd$cos_mid[which.min(yn - xn)])
-    }
-
-    # "abs" method
-    above <- which(bd$pct >= de_threshold_pct)
-    if (length(above) == 0) return(NA_real_)
-    bd$cos_mid[min(above)]
-  }
-  knee_r  <- detect_knee(bin_inc)
-  knee_nr <- detect_knee(bin_dec)
-
-  knees_df <- data.frame(
-    direction = factor(c("Increase", "Decrease"),
-                       levels = c("Increase", "Decrease")),
-    knee      = c(knee_r, knee_nr),
-    label     = c(sprintf("Renin knee = %.3f", knee_r),
-                  sprintf("Non-renin knee = %.3f", knee_nr))
-  )
-
   p <- ggplot(binned, aes(cos_mid, pct, colour = direction)) +
     geom_line(linewidth = 0.8) +
     geom_point(size = 1.5) +
-    geom_vline(data = knees_df,
-               aes(xintercept = knee, colour = direction),
-               linetype = "dashed", linewidth = 0.5, na.rm = TRUE,
-               show.legend = FALSE) +
-    geom_text(data = knees_df,
-              aes(x = knee, y = Inf, label = label, colour = direction),
-              hjust = -0.05, vjust = 1.5, size = 3, na.rm = TRUE,
-              show.legend = FALSE) +
     scale_x_continuous(
       name     = "cos sim to Renin label  (Increase line, bottom axis)",
       sec.axis = dup_axis(
@@ -1461,132 +762,37 @@ plot_pde_vs_cos_dual_axis <- function(df,
                         name = "DESeq2 direction") +
     labs(y = "% of regions called differential",
          caption = sprintf(
-           "Quantile-binned (%d bins each). Dashed verticals = knee where %%DE starts rising exponentially (%s%s). n_rows = %s (pooled across contrasts)",
-           n_bins,
-           if (knee_method == "kneedle") "Kneedle: max downward deviation from chord"
-           else sprintf("abs: first bin with %%DE >= %d%%", de_threshold_pct),
-           "",
-           format(nrow(df), big.mark = ",")
+           "Quantile-binned (%d bins each). n_rows = %s (pooled across contrasts)",
+           n_bins, format(nrow(df), big.mark = ",")
          )) +
     theme_bw(base_size = 11) +
     theme(panel.grid.minor = element_blank())
 
-  list(plot           = p,
-       knee_renin     = knee_r,
-       knee_non_renin = knee_nr,
-       bin_inc        = bin_inc,
-       bin_dec        = bin_dec)
 }
 
-# Default: kneedle inflection detection — picks the cos-sim where the
-# %DE curve starts rising exponentially, not where it has already climbed
-# past a fixed level. To override and use a hard %DE threshold instead
-# (e.g. for a high-purity cutoff), pass knee_method = "abs" and tune
-# de_threshold_pct.
-pde_avg_res <- plot_pde_vs_cos_dual_axis(
-  scatter_df,
-  n_bins      = 20,
-  knee_method = "kneedle"
-  # , de_threshold_pct = 50   # only used when knee_method = "abs"
-)
-
-# Export the two knee thresholds for downstream tornado subsetting (8g–8i).
-cos_renin_threshold     <- pde_avg_res$knee_renin
-cos_non_renin_threshold <- pde_avg_res$knee_non_renin
-message(sprintf(
-  "Knee thresholds: cos_renin >= %.3f, cos_non_renin >= %.3f",
-  cos_renin_threshold, cos_non_renin_threshold
-))
+p_pde_avg <- plot_pde_vs_cos_dual_axis(scatter_df, n_bins = 20)
 
 ggsave(file.path(plot_dir, "starspace_pde_vs_cos_avg.svg"),
-       pde_avg_res$plot, width = 7, height = 4.5, units = "in")
-```
+       p_pde_avg, width = 7, height = 4.5, units = "in")
 
-### (2a-bed) Subset regions by knee threshold for tornado feature sets
-
-These two GRanges are the embedding-defined "renin-specific" and
-"non-renin-specific" sets, ready to be slotted into the `feats` list in
-8g. They use the knee thresholds detected above, so they're tighter (or
-looser) than the DESeq2-derived sets exactly to the degree that the
-embedding agrees with DESeq2.
-
-**Manual override:** the Non-renin curve doesn't have a clean knee in
-this run, so its auto-detected `knee_non_renin` is noisy. Set both
-thresholds to the same well-defined value (the clear Renin-side knee at
-0.217) so the dec_nr / nd_nr filter on `cos_non_renin` mirrors the inc_r
-/ nd_r filter on `cos_renin`. Comment out the override block to fall
-back to the auto-detected per-direction knees.
-
-```{r}
-# ---- threshold override --------------------------------------------------
-# Set to NULL to use the auto-detected knee from pde_avg_res. Set to a
-# numeric to override (e.g. when Kneedle returns an unstable point because
-# the curve has no clear inflection).
-manual_cos_renin_threshold     <- 0.217   # NULL to use pde_avg_res$knee_renin
-manual_cos_non_renin_threshold <- 0.217   # NULL to use pde_avg_res$knee_non_renin
-
-cos_renin_threshold <- if (!is.null(manual_cos_renin_threshold))
-  manual_cos_renin_threshold else pde_avg_res$knee_renin
-cos_non_renin_threshold <- if (!is.null(manual_cos_non_renin_threshold))
-  manual_cos_non_renin_threshold else pde_avg_res$knee_non_renin
-
-message(sprintf(
-  "Using thresholds: cos_renin >= %.3f (%s), cos_non_renin >= %.3f (%s)",
-  cos_renin_threshold,
-  if (!is.null(manual_cos_renin_threshold)) "manual" else "auto/kneedle",
-  cos_non_renin_threshold,
-  if (!is.null(manual_cos_non_renin_threshold)) "manual" else "auto/kneedle"
-))
-# --------------------------------------------------------------------------
-
-names_to_granges <- function(names) {
-  parsed <- str_match(names, "^(.+)_([0-9]+)_([0-9]+)$")
-  ok <- !is.na(parsed[, 1])
-  GenomicRanges::makeGRangesFromDataFrame(data.frame(
-    seqnames = parsed[ok, 2],
-    start    = as.integer(parsed[ok, 3]),
-    end      = as.integer(parsed[ok, 4])
-  ))
-}
-
-renin_emb_set <- emb_df %>%
-  dplyr::filter(!is.na(cos_renin), cos_renin >= cos_renin_threshold) %>%
-  dplyr::pull(region) %>%
-  names_to_granges()
-
-non_renin_emb_set <- emb_df %>%
-  dplyr::filter(!is.na(cos_non_renin), cos_non_renin >= cos_non_renin_threshold) %>%
-  dplyr::pull(region) %>%
-  names_to_granges()
-
-message(sprintf(
-  "Embedding-defined sets: renin_emb_set = %s regions, non_renin_emb_set = %s regions",
-  format(length(renin_emb_set),     big.mark = ","),
-  format(length(non_renin_emb_set), big.mark = ",")
-))
-
-# Write to disk so 8g can reload them without re-running 8f.
-writeLines(
-  paste(GenomicRanges::seqnames(renin_emb_set),
-        GenomicRanges::start(renin_emb_set),
-        GenomicRanges::end(renin_emb_set), sep = "\t"),
-  file.path(bed_dir, "renin_emb_set.bed")
-)
-writeLines(
-  paste(GenomicRanges::seqnames(non_renin_emb_set),
-        GenomicRanges::start(non_renin_emb_set),
-        GenomicRanges::end(non_renin_emb_set), sep = "\t"),
-  file.path(bed_dir, "non_renin_emb_set.bed")
-)
 ```
 
 ### (2b) Faceted by contrast — primary_normal / primary_high / as_normal
 
 ```{r, fig.width = 12, fig.height = 4}
-p_pde_facet <- plot_pde_vs_cos(scatter_df, facet_by_contrast = TRUE)
+# One row per trained label, in `cluster_labels` order (focus first, so
+# Renin / Control / Tumoral). Built from cluster_labels rather than hardcoded
+# so a 2-label model still works -- it just draws two rows.
+pde_label_cols <- setNames(
+  paste0("cos_", gsub("[^A-Za-z0-9]+", "_", cluster_labels)),
+  cluster_labels)
+
+p_pde_facet <- plot_pde_vs_cos(scatter_df, facet_by_contrast = TRUE,
+                               label_cols = pde_label_cols)
 
 ggsave(file.path(plot_dir, "starspace_pde_vs_cos_by_contrast.svg"),
-       p_pde_facet, width = 12, height = 4, units = "in")
+       p_pde_facet, width = 12,
+       height = 3.4 * length(pde_label_cols), units = "in")
 ```
 
 # 8g. Tornado signal profiles
@@ -1600,43 +806,119 @@ load_bed <- function(path) {
               remove.unusual = FALSE, header = FALSE, skip = 0, sep = "\t")
 }
 
-dec_nr <- load_bed(file.path(bed_dir,"dec_nr.bed"))
-dec_r  <- load_bed(file.path(bed_dir,"dec_r.bed"))
-inc_nr <- load_bed(file.path(bed_dir,"inc_nr.bed"))
-inc_r  <- load_bed(file.path(bed_dir,"inc_r.bed"))
-nd_nr  <- load_bed(file.path(bed_dir,"nd_nr.bed"))
-nd_r   <- load_bed(file.path(bed_dir,"nd_r.bed"))
+# 8e writes one BED per (DESeq2 call x StarSpace label) plus the pooled
+# "_nr" complement. 8g-8i use the PER-LABEL files, not the pool, so every
+# feature set carries a single cluster identity and the two non-focal
+# labels are kept APART: _r = Renin, _c = Control, _t = Tumoral.
+#
+# The grid is built from what is on disk rather than hand-listed, so a model
+# with a different label vocabulary needs no edit here. Sets below
+# `min_set_size` are dropped with a reason printed -- previously
+# inc_control (30) and dec_r (3) were hardcoded out, which silently removed
+# Control from the Increase row of every figure.
+min_set_size <- 20
+
+label_slug  <- function(x) gsub("[^A-Za-z0-9]+", "_", x)
+# Suffix that 8e's bed_suffix() gave each label, inverted back to the label.
+bed_labels  <- if (exists("cluster_labels")) {
+  cluster_labels
+} else {
+  c(focus_label, "Control", "Tumoral")
+}
+suffix_of   <- function(lab) {
+  if (identical(lab, focus_label)) "r" else tolower(label_slug(lab))
+}
+# Short alias used in variable and panel names: "r" for the focal label,
+# first letter otherwise. Guard against two labels colliding on one letter.
+short_of    <- function(lab) {
+  if (identical(lab, focus_label)) "r" else substr(tolower(label_slug(lab)), 1, 1)
+}
+stopifnot(!anyDuplicated(vapply(bed_labels, short_of, character(1))))
+
+set_spec  <- list()
+gr_list   <- list()
+dropped   <- character(0)
+for (cat in c("inc", "dec", "nd")) {
+  for (lab in bed_labels) {
+    bed <- file.path(bed_dir, sprintf("%s_%s.bed", cat, suffix_of(lab)))
+    if (!file.exists(bed)) next
+    gr <- load_bed(bed)
+    nm <- paste(cat, short_of(lab), sep = "_")
+    if (length(gr) < min_set_size) {
+      dropped <- c(dropped, sprintf("%s (%d < %d)", nm, length(gr), min_set_size))
+      next
+    }
+    assign(nm, gr)
+    gr_list[[nm]]  <- gr
+    set_spec[[nm]] <- list(
+      label = lab,
+      split = if (cat == "nd") "nd" else "diff")
+  }
+}
+set_order <- names(set_spec)
+stopifnot(length(set_order) > 0)
+if (length(dropped))
+  message("Feature sets below min_set_size, dropped: ",
+          paste(dropped, collapse = ", "))
+
+# Tag for cache + plot filenames. Caches and SVGs are keyed by filename
+# alone, so the tag has to change whenever the SET MEMBERSHIP changes or a
+# stale .rds comes back with the wrong feature groups. Folding the count in
+# makes that automatic.
+set_tag <- sprintf("perlabel%d", length(set_order))
+
+# Everything downstream works off `gr_list`, not the individual variables.
+gr_list <- gr_list[set_order]
+message("Reloaded intersection BEDs:\n",
+        paste(sprintf("  %-6s %9s regions  (%s)", set_order,
+                      format(vapply(gr_list, length, integer(1)), big.mark = ","),
+                      vapply(set_spec, `[[`, character(1), "label")),
+              collapse = "\n"))
 ```
 
 ## Subset feature sets by top-N cos-sim ranking
 
-Replace the knee-based threshold with a fixed top-N count per subset.
-Each of the four DESeq×StarSpace subsets stays — only the *filter rule*
-changes:
+Row count per subset is capped at a fixed top-N, and this is the **only**
+selection applied to the tornado feature sets. Membership comes from the
+DESeq2 call × StarSpace label intersection; ordering comes from the cosine
+to that label. Each DESeq×StarSpace subset in `set_spec` stays, ranked by
+the cosine similarity to **its own** StarSpace label:
 
-- `inc_r`  → keep top N by `cos_renin`     (renin-confidence rank)
-- `nd_r`   → keep top N by `cos_renin`
-- `dec_nr` → keep top N by `cos_non_renin` (non-renin-confidence rank)
-- `nd_nr`  → keep top N by `cos_non_renin`
+- `inc_r`, `nd_r`          → keep top N by `cos_Renin`
+- `dec_c`, `nd_c`          → keep top N by `cos_Control`
+- `inc_t`, `dec_t`, `nd_t` → keep top N by `cos_Tumoral`
 
-Why: top-N gives **deterministic, balanced row counts per subset**
+This is stricter than the old pooled rule: `cos_non_renin` was the *max*
+over Control and Tumoral, so a Control set could be ranked by a region's
+Tumoral affinity. Per-label ranking asks each set only about the cluster
+it actually came from.
+
+Why top-N: it gives **deterministic, balanced row counts per subset**
 (every subset is at most `top_n`), so the heatmaps stop being dominated
-by the huge `nd_*` blocks. The DESeq2 categorization is preserved.
+by the huge `nd_*` blocks. The DESeq2 categorization is preserved. Note
+`dec_c` (69) and `dec_t` (51) start well under `top_n`, so this step is a
+no-op for them — they are bounded by their own size, not by N.
 
-Needs `emb_df` from 8f (cos_renin / cos_non_renin per region).
+Needs `emb_df` from 8f, which writes one `cos_<label>` column per
+StarSpace label alongside `cos_renin` / `cos_non_renin`.
 
 ```{r}
 top_n <- 1000
 
-if (!exists("emb_df") || is.null(emb_df$cos_renin) ||
-    is.null(emb_df$cos_non_renin)) {
-  stop("emb_df with cos_renin / cos_non_renin not in scope. ",
-       "Run 8f first or rebuild it here.")
+# 8f slugs label names when it builds the per-label columns; match it.
+cos_col <- function(label) paste0("cos_", gsub("[^A-Za-z0-9]+", "_", label))
+
+needed_cols <- unique(vapply(set_spec, function(s) cos_col(s$label), character(1)))
+if (!exists("emb_df") || !all(needed_cols %in% names(emb_df))) {
+  stop("emb_df is missing column(s): ",
+       paste(setdiff(needed_cols, if (exists("emb_df")) names(emb_df) else character(0)),
+             collapse = ", "),
+       ". Run 8f first — it writes one cos_<label> column per StarSpace label.")
 }
 
-# Key lookups: "chr_start_end" -> per-region cosine sim
-key_cos_renin     <- setNames(emb_df$cos_renin,     emb_df$region)
-key_cos_non_renin <- setNames(emb_df$cos_non_renin, emb_df$region)
+# Key lookups: "chr_start_end" -> per-region cosine sim, one per label.
+key_cos <- lapply(setNames(nm = needed_cols),
+                  function(cn) setNames(emb_df[[cn]], emb_df$region))
 
 gr_to_key <- function(gr) {
   paste(GenomicRanges::seqnames(gr),
@@ -1654,110 +936,42 @@ filter_top_by_cos <- function(gr, cos_lookup, top_n) {
   gr[head(ord, top_n)]
 }
 
-sizes_before <- vapply(
-  list(inc_r = inc_r, dec_nr = dec_nr, nd_r = nd_r, nd_nr = nd_nr),
-  length, integer(1)
-)
+sizes_before <- vapply(gr_list, length, integer(1))
 
-# Renin-side filter (inc_r, nd_r) -> top by cos_renin
-inc_r <- filter_top_by_cos(inc_r, key_cos_renin,     top_n)
-nd_r  <- filter_top_by_cos(nd_r,  key_cos_renin,     top_n)
-# Non-renin-side filter (dec_nr, nd_nr) -> top by cos_non_renin
-dec_nr <- filter_top_by_cos(dec_nr, key_cos_non_renin, top_n)
-nd_nr  <- filter_top_by_cos(nd_nr,  key_cos_non_renin, top_n)
+# Every set ranked by the cosine to its own StarSpace label, and capped at
+# top_n. This is the ONLY selection applied to the tornado feature sets:
+# membership comes from the DESeq2 call x StarSpace label intersection, and
+# ordering comes from the cosine. Nothing is matched, weighted, or
+# thresholded on a third variable.
+#
+# baseMean matching was tried here and REMOVED (2026-09-05). It is not used
+# in the differential section either, and measurement showed it does not do
+# what it was meant to: baseMean correlates with bigWig coverage at only
+# Spearman 0.41-0.68, and matching inc_r's baseMean exactly (2.70 -> 3.67)
+# moved the PN bigWig gap just 4.44x -> 3.58x while pushing NR, NRT and TN
+# FURTHER from parity. See notes/BASEMEAN_MATCHING_2026-09-04.md.
+gr_list <- lapply(set_order, function(nm)
+  filter_top_by_cos(gr_list[[nm]],
+                    key_cos[[cos_col(set_spec[[nm]]$label)]], top_n))
+names(gr_list) <- set_order
 
-sizes_after <- c(
-  inc_r  = length(inc_r),
-  dec_nr = length(dec_nr),
-  nd_r   = length(nd_r),
-  nd_nr  = length(nd_nr)
-)
+sizes_after <- vapply(gr_list, length, integer(1))
 
-message(sprintf("Top-%d subset:", top_n))
-for (nm in names(sizes_before)) {
-  message(sprintf("  %-7s %s -> %s",
-                  paste0(nm, ":"),
-                  format(sizes_before[[nm]], big.mark = ","),
-                  format(sizes_after[[nm]],  big.mark = ",")))
-}
-```
-
-## Subset feature sets by cos-sim knee from 8f
-
-Restricts each feature set to regions on the "correct" side of the knee
-detected in 8f section (2a):
-
-- `_r` sets (Renin cluster) → keep only regions with
-  `cos_renin >= cos_renin_threshold`
-- `_nr` sets (Non-renin cluster) → keep only regions with
-  `cos_non_renin >= cos_non_renin_threshold`
-
-Why: regions that pass the embedding cluster's k-means filter but still
-sit below the knee are the embedding's lukewarm calls — they don't show
-the renin/non-renin signal strongly. Dropping them sharpens the tornado
-average, drops peak memory by 5–20× depending on where the knee lands,
-and is the same operation visually summarized by the dashed knee lines
-in 8f (2a).
-
-The two embedding BED files were written at the end of 8f by the
-(2a-bed) chunk. Falls back to the unfiltered sets with a clear message
-if those BEDs aren't on disk yet (e.g. you're running 8g before 8f).
-
-```{r}
-emb_bed_paths <- c(
-  renin     = "bed/renin_emb_set.bed",
-  non_renin = "bed/non_renin_emb_set.bed"
-)
-
-if (all(file.exists(emb_bed_paths))) {
-  renin_emb_set     <- load_bed(emb_bed_paths[["renin"]])
-  non_renin_emb_set <- load_bed(emb_bed_paths[["non_renin"]])
-
-  # "chr_start_end" key matching — matches the convention used in 8c/8e.
-  gr_keys <- function(gr) {
-    paste(GenomicRanges::seqnames(gr),
-          GenomicRanges::start(gr),
-          GenomicRanges::end(gr), sep = "_")
-  }
-  renin_emb_keys     <- gr_keys(renin_emb_set)
-  non_renin_emb_keys <- gr_keys(non_renin_emb_set)
-
-  subset_gr <- function(gr, keys) gr[gr_keys(gr) %in% keys]
-
-  sizes_before <- vapply(
-    list(inc_r = inc_r, dec_nr = dec_nr, nd_r = nd_r, nd_nr = nd_nr),
-    length, integer(1)
-  )
-
-  inc_r  <- subset_gr(inc_r,  renin_emb_keys)
-  nd_r   <- subset_gr(nd_r,   renin_emb_keys)
-  dec_nr <- subset_gr(dec_nr, non_renin_emb_keys)
-  nd_nr  <- subset_gr(nd_nr,  non_renin_emb_keys)
-
-  sizes_after <- c(
-    inc_r  = length(inc_r),
-    dec_nr = length(dec_nr),
-    nd_r   = length(nd_r),
-    nd_nr  = length(nd_nr)
-  )
-
-  message("Subset feature sets by cos-sim knee:")
-  for (nm in names(sizes_before)) {
-    message(sprintf(
-      "  %-7s %s -> %s  (%.1f%% kept)",
-      paste0(nm, ":"),
-      format(sizes_before[[nm]], big.mark = ","),
-      format(sizes_after[[nm]],  big.mark = ","),
-      100 * sizes_after[[nm]] / max(sizes_before[[nm]], 1)
-    ))
-  }
-} else {
-  missing <- emb_bed_paths[!file.exists(emb_bed_paths)]
+# top_n is a COUNT, so the cosine value it cuts at differs per set: for a
+# 200,000-region set it is the top 0.5%, for dec_c (69) it is a no-op. Print
+# the surviving cosine range so that truncation is visible, not implicit.
+message(sprintf("Ranked by cosine, capped at top-%s:", format(top_n, big.mark = ",")))
+for (nm in set_order) {
+  cvs <- key_cos[[cos_col(set_spec[[nm]]$label)]][gr_to_key(gr_list[[nm]])]
+  cvs <- cvs[is.finite(cvs)]
   message(sprintf(
-    "Embedding BED(s) missing — tornado feature sets stay un-subset.\n  Missing: %s\n  Working dir: %s\n  Run 8f section (2a-bed) and stage the BEDs to this dir to enable subsetting.",
-    paste(missing, collapse = ", "),
-    getwd()
-  ))
+    "  %-7s %9s -> %9s  (%5.1f%% kept; cos %.3f to %.3f, ranked by %s)",
+    paste0(nm, ":"), format(sizes_before[[nm]], big.mark = ","),
+    format(sizes_after[[nm]], big.mark = ","),
+    100 * sizes_after[[nm]] / max(sizes_before[[nm]], 1),
+    if (length(cvs)) min(cvs) else NA_real_,
+    if (length(cvs)) max(cvs) else NA_real_,
+    cos_col(set_spec[[nm]]$label)))
 }
 ```
 
@@ -1765,8 +979,8 @@ if (all(file.exists(emb_bed_paths))) {
 
 Two bigwig configurations — one for each tornado plot we'll produce:
 
-1.  **`bigwigs_avg`**: four group averages (Non-renin, WT, Recruited,
-    Tumoral).
+1.  **`bigwigs_avg`**: five group averages (Non-renin, WT, Recruited,
+    Tumoral, Non-renin tumoral).
 2.  **`bigwigs_samples`**: hand-picked individual replicate bigwigs.
 
 `EnrichedHeatmap`'s `normalizeToMatrix` takes a GRanges of signal
@@ -1781,6 +995,7 @@ PEPATAC output layout (renin + ENCODE pipelines):
 renin_bw_base  <- "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline_PEPATAC/renin_ATAC/results_pipeline"
 encode_bw_base <- "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline_PEPATAC/encode_ATAC/results_pipeline"
 susztak_bw_base <- "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline_PEPATAC/susztak_ATAC/results_pipeline"
+ctrl_tumoral_bw_base <- "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline_PEPATAC/ctrl_tumoral_ATAC/results_pipeline"
 
 pepatac_bw <- function(sample_id, base = renin_bw_base) {
   file.path(base, sample_id, "aligned_mm10",
@@ -1792,52 +1007,274 @@ pepatac_bw <- function(sample_id, base = renin_bw_base) {
 # Order here = display order in legends and as columns in the heatmap.
 avg_bw_dir <- "/project/shefflab/brickyard/results_pipeline/gomez_atac/results_pipeline_PEPATAC/data"
 
+# Ordered renin -> non-renin, with the two tumoral tracks adjacent.
 bigwigs_avg <- c(
-  WT = file.path(avg_bw_dir, "PN_average.bw"),   # wild-type renin cells (subset of Renin_Normal)
-  PH = file.path(avg_bw_dir, "PH_average.bw"),   # primary high (recruited)
-  TN = file.path(avg_bw_dir, "TN_average.bw"),   # tumoral (As4.1)
-  NR = file.path(avg_bw_dir, "NR_average.bw")    # non-renin (ENCODE controls)
+  WT  = file.path(avg_bw_dir, "PN_average.bw"),   # wild-type renin cells (subset of Renin_Normal)
+  PH  = file.path(avg_bw_dir, "PH_average.bw"),   # primary high (recruited)
+  TN  = file.path(avg_bw_dir, "TN_average.bw"),   # tumoral (As4.1)
+  NRT = file.path(avg_bw_dir, "NRT_average.bw"),  # non-renin tumoral (ctrl_tumoral_ATAC, 51 cell-line samples)
+  NR  = file.path(avg_bw_dir, "NR_average.bw")    # non-renin (ENCODE controls)
 )
 stopifnot(all(file.exists(bigwigs_avg)))
 
-# (2) Selected per-replicate bigwigs — for the per-sample tornado.
-# Display name on the left, PEPATAC sample id (= dir name) on the right.
-bigwigs_samples <- c(
-  "WT_1"                  = pepatac_bw("WT_1"),
-  "WT_2"                  = pepatac_bw("WT_2"),
-  "Ren1c-YFP_1"           = pepatac_bw("Ren1c-YFP_1"),
-  "Ren1c-YFP_2"           = pepatac_bw("Ren1c-YFP_2"),
-  "Ren1c-YFP_Low_Na+Cap_1"= pepatac_bw("Ren1c-YFP_Low_Na+Cap_1"),
-  "Ren1c-YFP_Low_Na+Cap_2"= pepatac_bw("Ren1c-YFP_Low_Na+Cap_2"),
-  "Ren1c--_Ren1c-YFP_1"   = pepatac_bw("Ren1c--_Ren1c-YFP_1"),
-  "Ren1c--_Ren1c-YFP_2"   = pepatac_bw("Ren1c--_Ren1c-YFP_2"),
-  "Recruited_1"           = pepatac_bw("Recruited_1"),
-  "Recruited_2"           = pepatac_bw("Recruited_2"),
-  "Recruited_GFP"         = pepatac_bw("Recruited_GFP"),
-  "ASKO_1"                = pepatac_bw("ASKO_1"),
-  "ASKO_2"                = pepatac_bw("ASKO_2"),
-  "As4.1_2"               = pepatac_bw("As4.1_2"),
-  "As4.1_H89_Vehicle_1"   = pepatac_bw("As4.1_H89_Vehicle_1"),
-  "As4.1_H89_Vehicle_2"   = pepatac_bw("As4.1_H89_Vehicle_2"),
-  "As4.1_Jq1_-_1"         = pepatac_bw("As4.1_Jq1_-_1"),
-  "As4.1_Jq1_-_2"         = pepatac_bw("As4.1_Jq1_-_2"),
-  "As4.1_A485_Vehicle_2"  = pepatac_bw("As4.1_A485_Vehicle_2"),
-  # ENCODE / Susztak control samples — separate PEPATAC base
-  "P0_1"                  = pepatac_bw("P0_mouse_kidney_bulk_ATAC-seq_sample_1", susztak_bw_base),
-  "P0_2"                  = pepatac_bw("P0_mouse_kidney_bulk_ATAC-seq_sample_2", susztak_bw_base),
-  "3W_1"                  = pepatac_bw("3-week_mouse_kidney_bulk_ATAC-seq_sample_1", susztak_bw_base),
-  "3W_2"                  = pepatac_bw("3-week_mouse_kidney_bulk_ATAC-seq_sample_2", susztak_bw_base),
-  "8W_1"                  = pepatac_bw("8-week_mouse_kidney_bulk_ATAC-seq_sample_1", susztak_bw_base),
-  "8W_2"                  = pepatac_bw("8-week_mouse_kidney_bulk_ATAC-seq_sample_2", susztak_bw_base),
-  "ENCSR023QZX_1"         = pepatac_bw("ENCSR023QZX_1", encode_bw_base),
-  "ENCSR023QZX_2"         = pepatac_bw("ENCSR023QZX_2", encode_bw_base),
-  "ENCSR389CLN_1"         = pepatac_bw("ENCSR389CLN_1", encode_bw_base),
-  "ENCSR389CLN_2"         = pepatac_bw("ENCSR389CLN_2", encode_bw_base),
-  "ENCSR732OTZ_1"         = pepatac_bw("ENCSR732OTZ_1", encode_bw_base),
-  "ENCSR732OTZ_2"         = pepatac_bw("ENCSR732OTZ_2", encode_bw_base),
-  "ENCSR758IRM_1"         = pepatac_bw("ENCSR758IRM_1", encode_bw_base),
-  "ENCSR758IRM_2"         = pepatac_bw("ENCSR758IRM_2", encode_bw_base)
-)
+# (2) Per-replicate bigwigs — for the per-sample tornado.
+#
+# Selected from metadata, not hand-listed, so the panel tracks the pipeline
+# directories and the annotation sheet rather than drifting from them:
+#
+#   Renin_WT / Renin_Recruited / Renin_Tumoral : ALL samples
+#   Control_Primary / Control_Tumoral          : KIDNEY tissue only
+#
+# Renin is a kidney gene, so non-kidney controls are the wrong comparison —
+# and taking all of them would mean 178 ENCODE + 51 tumour-line columns.
+#
+# "Kidney" is decided two ways because the two control groups annotate
+# tissue differently:
+#   * Control_Primary carries the organ directly ("primary_kidney_cells").
+#   * Control_Tumoral carries a CELL LINE in `Tissue` ("RENCA", "RAG"); which
+#     lines are renal comes from the `tissue` column of
+#     renin_annotation_sheet_add_tumoral_l4.csv ("RENCA_renal_carcinoma",
+#     "RAG_renal_adenocarcinoma"). That sheet keys by abbreviated names
+#     (RENCA_EVP_1) that do not match the pipeline directories, so the join
+#     goes directory -> `Tissue` in renin_encode_atac.csv -> renal? in l4.
+meta_bw <- read.csv(path.expand(
+  "~/code/renin_atac/metadata/renin_encode_atac.csv"), stringsAsFactors = FALSE)
+l4_tissue <- read.csv(path.expand(
+  "~/code/renin_atac/metadata/renin_annotation_sheet_add_tumoral_l4.csv"),
+  stringsAsFactors = FALSE)$tissue
+
+kidney_re    <- "kidney|renal"
+kidney_lines <- unique(sub("_.*$", "",
+  l4_tissue[grepl(kidney_re, l4_tissue, ignore.case = TRUE)]))
+is_kidney <- function(tis) {
+  !is.na(tis) & (grepl(kidney_re, tis, ignore.case = TRUE) | tis %in% kidney_lines)
+}
+
+# sample id -> pipeline project, by scanning the PEPATAC roots.
+#
+# `exclude_projects` drops a whole PEPATAC project from the per-sample panel.
+# susztak_ATAC is excluded: it is the only pre-pipestat run in the set
+# (2021-2024, and the one whose assets.tsv pointed at a retired refgenie),
+# so its tracks are the least comparable with the rest. Removing it leaves
+# Control_Primary as 8 ENCODE kidney samples from a single processing batch.
+exclude_projects <- "susztak_ATAC"
+
+bw_roots <- c(renin_ATAC        = renin_bw_base,
+              encode_ATAC       = encode_bw_base,
+              susztak_ATAC      = susztak_bw_base,
+              ctrl_tumoral_ATAC = ctrl_tumoral_bw_base)
+bw_roots <- bw_roots[setdiff(names(bw_roots), exclude_projects)]
+if (length(exclude_projects)) {
+  message("Excluded PEPATAC project(s) from the per-sample panel: ",
+          paste(exclude_projects, collapse = ", "))
+}
+sample_root <- unlist(lapply(bw_roots, function(r)
+  stats::setNames(rep(r, length(list.files(r))), list.files(r))))
+names(sample_root) <- sub("^[^.]*\\.", "", names(sample_root))   # drop the root prefix
+
+take_all    <- c("Renin_WT", "Renin_Recruited", "Renin_Tumoral")
+take_kidney <- c("Control_Primary", "Control_Tumoral")
+
+sel <- meta_bw[meta_bw$Group_2 %in% c(take_all, take_kidney) &
+               meta_bw$SampleID %in% names(sample_root), ]
+sel <- sel[sel$Group_2 %in% take_all | is_kidney(sel$Tissue), ]
+
+# Samples that have a pipeline directory but no Group_2 are reported, never
+# silently dropped — As4.1_1 is one, and it is a real renin tumoral library.
+renin_unassigned <- setdiff(list.files(renin_bw_base),
+                            meta_bw$SampleID[nzchar(meta_bw$Group_2)])
+if (length(renin_unassigned)) {
+  message("NOTE: renin_ATAC sample(s) with no Group_2, EXCLUDED: ",
+          paste(renin_unassigned, collapse = ", "))
+}
+
+# Long susztak ids are unreadable as a heatmap `name`; panels are titled by
+# group anyway, so abbreviate purely for legends and messages. Inert while
+# susztak_ATAC is in `exclude_projects`; kept so re-including it stays a
+# one-word change.
+short_name <- function(x) {
+  x <- sub("^([0-9]+)-week_mouse_kidney_bulk_ATAC-seq_sample_", "\\1W_", x)
+  sub("^P0_mouse_kidney_bulk_ATAC-seq_sample_", "P0_", x)
+}
+bigwigs_samples <- stats::setNames(
+  pepatac_bw(sel$SampleID, sample_root[sel$SampleID]),
+  short_name(sel$SampleID))
+
+stopifnot(!anyDuplicated(names(bigwigs_samples)))
+stopifnot(all(file.exists(bigwigs_samples)))
+
+for (g in c(take_all, take_kidney)) {
+  ids <- sel$SampleID[sel$Group_2 == g]
+  message(sprintf("  %-16s n=%2d  (%s)", g, length(ids),
+                  paste(sort(unique(sel$Tissue[sel$Group_2 == g])), collapse = ", ")))
+}
+excluded <- meta_bw[meta_bw$Group_2 %in% take_kidney &
+                    meta_bw$SampleID %in% names(sample_root) &
+                    !is_kidney(meta_bw$Tissue), ]
+message(sprintf("  excluded %d non-kidney control sample(s) across %d tissue(s)",
+                nrow(excluded), length(unique(excluded$Tissue))))
+
+# 4T1_Adherent_2, 4T1_DAC_decitabine_3 and 4T1_MFP_2 never had chrM removed
+# (2026-08-17 QC audit). All three are 4T1, so none survive the kidney
+# filter — checked rather than assumed, since the filter could change.
+chrm_dirty <- c("4T1_Adherent_2", "4T1_DAC_decitabine_3", "4T1_MFP_2")
+if (any(chrm_dirty %in% sel$SampleID)) {
+  message("NOTE: chrM not removed from ",
+          paste(intersect(chrm_dirty, sel$SampleID), collapse = ", "),
+          " (<=1.02x low; fine for display, not for FRiP/complexity).")
+}
+message(sprintf("Per-sample bigWigs: %d total", length(bigwigs_samples)))
+```
+
+## Sample -> group map for the per-sample tornado
+
+The per-sample heatmap has 49 columns. Labelling each with its sample id is
+unreadable and is not the comparison being made, so panels are ordered by
+sample group and each group is named once, over the middle panel of its run.
+
+Groups come from the `Group_2` column of `metadata/renin_encode_atac.csv`,
+which already carries exactly these five levels — they are not re-derived
+here. All 49 samples resolve; the chunk stops if any does not.
+
+Two things this figure cannot hide, both from the 2026-08-17 QC audit
+(`notes/data_quality_ENCODE_comparison_2026-08-17.md`):
+
+* **`Control_Tumoral` is the 10 KIDNEY lines only** — RENCA (8) and RAG (2)
+  — not all 51 in `ctrl_tumoral_ATAC`. Renin is a kidney gene, so the breast,
+  lung, melanoma, colon and pancreatic lines are the wrong comparison, and 51
+  columns would swamp the figure. Note this makes the per-sample
+  `Control_Tumoral` a different set from `NRT_average.bw`, which pools all
+  51 — the two figures are not showing the same samples for that group.
+* **`WT_1` / `WT_2` are the same libraries as `Ren1c-YFP_1` / `Ren1c-YFP_2`**
+  under two names. `Renin_WT` therefore shows four panels for two unique
+  libraries. Set `drop_duplicate_wt <- TRUE` to plot the two unique ones.
+
+```{r}
+drop_duplicate_wt <- FALSE   # TRUE drops Ren1c-YFP_1/_2, the duplicate copies
+
+# meta_bw was read when bigwigs_samples was built, just above.
+meta_df <- meta_bw
+stopifnot(all(c("SampleID", "Group_2") %in% names(meta_df)))
+
+# bigwigs_samples is keyed by display name; recover the PEPATAC sample id
+# from the path, which is the directory the bigwig sits in.
+sample_id_of <- function(paths) basename(dirname(dirname(paths)))
+sample_groups <- stats::setNames(
+  meta_df$Group_2[match(sample_id_of(bigwigs_samples), meta_df$SampleID)],
+  names(bigwigs_samples))
+
+if (anyNA(sample_groups)) {
+  stop("No Group_2 for: ",
+       paste(names(sample_groups)[is.na(sample_groups)], collapse = ", "))
+}
+
+if (drop_duplicate_wt) {
+  dup <- c("Ren1c-YFP_1", "Ren1c-YFP_2")
+  bigwigs_samples <- bigwigs_samples[setdiff(names(bigwigs_samples), dup)]
+  sample_groups   <- sample_groups[names(bigwigs_samples)]
+  message("Dropped duplicate WT copies: ", paste(dup, collapse = ", "))
+}
+
+# Order panels by group so each group is one contiguous run — the column-title
+# logic in build_tornado_heatmap_independent() depends on it.
+group_levels    <- c("Renin_WT", "Renin_Recruited", "Renin_Tumoral",
+                     "Control_Primary", "Control_Tumoral")
+present         <- intersect(group_levels, unique(sample_groups))
+ord             <- order(match(sample_groups, present))
+bigwigs_samples <- bigwigs_samples[ord]
+sample_groups   <- factor(sample_groups[ord], levels = present)
+stopifnot(!is.unsorted(as.integer(sample_groups)))   # runs are contiguous
+
+message("Per-sample panels, grouped:")
+for (g in present) {
+  nm <- names(sample_groups)[sample_groups == g]
+  message(sprintf("  %-16s n=%2d  %s", g, length(nm), paste(nm, collapse = ", ")))
+}
+missing_groups <- setdiff(group_levels, present)
+if (length(missing_groups)) {
+  message("  NOT represented per-sample: ", paste(missing_groups, collapse = ", "),
+          " (group-average figure only)")
+}
+```
+
+## Per-track background scale factors
+
+FRiP differs **17-fold** across these sample groups — 0.030 in sorted renin
+primary vs 0.501 in the tumour lines
+(`notes/data_quality_ENCODE_comparison_2026-08-17.md`). That is
+signal-to-noise, not depth, so PEPATAC's per-sample normalisation does not
+touch it and no rescaling can undo it. Measured over 20,000 matched
+background bins the tracks agree to within 1.45x, but at the 99th percentile
+they differ 4.7x — the whole disparity lives in the peaks.
+
+Consequence for the figures: on one shared colour scale (cap = max q99 =
+7.86e-08, set by Ctrl_tumoral) the two renin primary tracks reach only ~21%
+of the ramp. They look washed out for reasons that have nothing to do with
+chromatin.
+
+`heatmap_norm = "background"` divides each track by its own genomic
+background, so the colour becomes **fold enrichment over that track's noise
+floor** and means the same thing in every column. Background is estimated
+from random 10-kb genomic bins, NOT from peaks and NOT from the consensus
+universe — peak-derived factors are biased exactly when composition differs,
+which is the situation here. This is the standard signal-over-background
+construction (MACS2 `fold_enrichment`, `bigwigCompare --ratio`).
+
+That the result is not itself a FRiP artifact is checkable, and it checks
+out: FRiP ranks WT lowest and Ctrl_tumoral highest, while `inc_r` enrichment
+ranks them the other way round (7.31 vs 1.18), and `dec_c` flips completely
+(0.89 in WT vs 6.54 in Ctrl_tumoral). A quality artifact would push the
+high-FRiP tracks up everywhere.
+
+Factors are cached — the bins are random but seeded, so the same factors
+come back across runs.
+
+```{r}
+bg_bin_n     <- 20000
+bg_bin_width <- 10000
+bg_seed      <- 3
+
+bw_background_factors <- function(bigwigs, n = bg_bin_n, w = bg_bin_width,
+                                  seed = bg_seed, cache = NULL) {
+  if (!is.null(cache) && file.exists(cache)) {
+    f <- readRDS(cache)
+    if (setequal(names(f), names(bigwigs))) {
+      message("Background factors from cache: ", cache)
+      return(f[names(bigwigs)])
+    }
+  }
+  si <- GenomeInfoDb::seqinfo(rtracklayer::BigWigFile(bigwigs[[1]]))
+  keep <- grep("^chr[0-9XY]+$", GenomeInfoDb::seqnames(si), value = TRUE)
+  si <- si[keep]
+  sl <- GenomeInfoDb::seqlengths(si)
+
+  set.seed(seed)
+  ch <- sample(names(sl), n, replace = TRUE, prob = sl / sum(sl))
+  st <- as.integer(stats::runif(n, 1, sl[ch] - w))
+  bg <- GenomicRanges::GRanges(ch, IRanges::IRanges(st, st + w - 1L))
+
+  f <- vapply(bigwigs, function(path) {
+    sig <- rtracklayer::import(path, which = bg, as = "RleList")
+    v   <- rep(NA_real_, length(bg)); cc <- as.character(GenomicRanges::seqnames(bg))
+    for (c1 in intersect(unique(cc), names(sig))) {
+      i <- which(cc == c1)
+      v[i] <- as.numeric(mean(IRanges::Views(sig[[c1]],
+                GenomicRanges::start(bg)[i], GenomicRanges::end(bg)[i])))
+    }
+    mean(v, na.rm = TRUE)
+  }, numeric(1))
+
+  message(sprintf("Background factors (%s x %s-kb bins):", format(n, big.mark = ","), w/1000))
+  for (nm in names(f)) message(sprintf("  %-14s %.4g", nm, f[[nm]]))
+  message(sprintf("  spread across tracks: %.2fx", max(f)/min(f)))
+  if (!is.null(cache)) saveRDS(f, cache)
+  f
+}
+
+bg_avg     <- bw_background_factors(bigwigs_avg,
+                 cache = file.path(plot_dir, "bg_factors_avg.rds"))
+bg_samples <- bw_background_factors(bigwigs_samples,
+                 cache = file.path(plot_dir, "bg_factors_samples.rds"))
 ```
 
 ## Define feature set + signal-binning helper
@@ -1921,17 +1358,15 @@ flatten_features_eh <- function(features, bigwigs, extend = 1000, w = 20,
   do.call(rbind, out[seq_len(k)])
 }
 
-# DESeq2 × StarSpace intersection feature sets for tornado + heatmap:
-#   inc_r  = Increase × Renin     (top-N by cos_renin within inc_r)
-#   dec_nr = Decrease × Non_renin (top-N by cos_non_renin within dec_nr)
-#   nd_r   = Non_diff × Renin     (top-N by cos_renin within nd_r)
-#   nd_nr  = Non_diff × Non_renin (top-N by cos_non_renin within nd_nr)
-feats <- GRangesList(
-  "inc_r"  = inc_r,
-  "dec_nr" = dec_nr,
-  "nd_r"   = nd_r,
-  "nd_nr"  = nd_nr
-)
+# DESeq2 × StarSpace intersection feature sets for tornado + heatmap — one
+# per (DESeq2 call × StarSpace label), as declared in `set_spec` in 8g.
+# The two non-focal labels are kept SEPARATE throughout (_c = Control,
+# _t = Tumoral); the pooled "_nr" union is 8j's, not this section's. With a
+# 3-label model the grid is inc/dec/nd × Renin/Control/Tumoral, minus any
+# set under `min_set_size`.
+# Each was ranked top-N by its own label's cosine. The pooled "_nr" sets are
+# no longer used here.
+feats <- do.call(GRangesList, gr_list)
 ```
 
 # 8h. Tornado line plots
@@ -1944,15 +1379,34 @@ shared with the heatmap top-annotation lines in 8i.
 ## Helpers
 
 ```{r}
-# Shared discrete color palette for the 4 feature groups. Same colors
-# in tornado_facets() lines and build_tornado_heatmap_independent()
+# Shared discrete color palette for the feature groups. Same colors in
+# tornado_facets() lines and build_tornado_heatmap_independent()
 # top-annotation curves so the two figures cross-reference visually.
+#
+# The seven hues below are the historical assignment and are kept so old
+# figures stay comparable — inc_r red, nd_r blue/cyan, as in the original
+# 4-set palette. `set_spec` is now built from whatever labels the model has
+# (§8g), so any set without an entry here — inc_c, dec_r, or a set from a
+# different label vocabulary — gets a hue appended from hue_pal(). Never
+# reorder the fixed block: the colors are referenced in written-up figures.
 feature_group_colors <- c(
-  inc_r  = "#F8766D",   # red/pink
-  dec_nr = "#7CAE00",   # green
-  nd_r   = "#00BFC4",   # cyan
-  nd_nr  = "#C77CFF"    # purple
+  inc_r = "#F8766D",   # red    — Increase × Renin
+  inc_t = "#C49A00",   # gold   — Increase × Tumoral
+  dec_c = "#53B400",   # green  — Decrease × Control
+  dec_t = "#00C094",   # teal   — Decrease × Tumoral
+  nd_r  = "#00B6EB",   # blue   — Non-diff × Renin
+  nd_c  = "#A58AFF",   # purple — Non-diff × Control
+  nd_t  = "#FB61D7"    # pink   — Non-diff × Tumoral
 )
+
+missing_cols <- setdiff(set_order, names(feature_group_colors))
+if (length(missing_cols)) {
+  extra <- scales::hue_pal(h = c(15, 375), l = 45)(length(missing_cols))
+  names(extra) <- missing_cols
+  feature_group_colors <- c(feature_group_colors, extra)
+  message("Palette extended for ", length(missing_cols), " new set(s): ",
+          paste(missing_cols, collapse = ", "))
+}
 
 # Line + ribbon plot, faceted by sample. `ribbon` controls the band:
 #   "sem"  = mean ± SEM (default — narrow at high n; shows mean reliability)
@@ -2009,12 +1463,15 @@ tornado_facets <- function(df, title,
 ## (1) Group-averaged tornado
 
 ```{r}
-df_avg_rds <- file.path(plot_dir, "df_avg_1k_w20.rds")
+# set_tag keeps the per-label caches separate from the old 4-set ones,
+# which were keyed by filename alone.
+df_avg_rds <- file.path(plot_dir, sprintf("df_avg_1k_w20_%s.rds", set_tag))
 df_avg <- if (file.exists(df_avg_rds)) {
   message("Loading cached df_avg from ", df_avg_rds)
   readRDS(df_avg_rds)
 } else {
-  message("Computing df_avg (4 bigwig imports + normalizeToMatrix)...")
+  message(sprintf("Computing df_avg (%d bigwig imports x %d feature sets)...",
+                  length(bigwigs_avg), length(feats)))
   out <- flatten_features_eh(feats, bigwigs_avg, extend = 1000, w = 20)
   saveRDS(out, df_avg_rds)
   out
@@ -2025,7 +1482,8 @@ p_avg <- tornado_facets(
   "ATAC signal at region midpoints (group averages, mean ± SEM)",
   ribbon = "sem"
 )
-ggsave(file.path(plot_dir, "tornado_group_averages_1k_w20.svg"),
+ggsave(file.path(plot_dir,
+                 sprintf("tornado_group_averages_1k_w20_%s.svg", set_tag)),
        p_avg, width = 12, height = 8, units = "in", dpi = 300)
 ```
 
@@ -2053,7 +1511,8 @@ feats_for_samples <- if (is.null(subsample_n)) {
 }
 vapply(feats_for_samples, length, integer(1))
 
-df_samples_rds <- file.path(plot_dir, "df_samples_1k_w20.rds")
+df_samples_rds <- file.path(plot_dir,
+                            sprintf("df_samples_1k_w20_%s.rds", set_tag))
 df_samples <- if (file.exists(df_samples_rds)) {
   message("Loading cached df_samples from ", df_samples_rds)
   readRDS(df_samples_rds)
@@ -2073,7 +1532,8 @@ p_samples <- tornado_facets(
 ) +
   theme(legend.text     = element_text(size = 7),
         legend.key.size = unit(0.6, "lines"))
-ggsave(file.path(plot_dir, "tornado_per_sample_1k_w20.svg"),
+ggsave(file.path(plot_dir,
+                 sprintf("tornado_per_sample_1k_w20_%s.svg", set_tag)),
        p_samples, width = 16, height = 12, units = "in", dpi = 300)
 ```
 
@@ -2135,13 +1595,33 @@ compute_tornado_matrices <- function(features, bigwigs, extend = 1000, w = 20,
 # color function spanning every (sample, group, bin) cell. Lets multiple
 # build_tornado_heatmap_independent() calls (e.g. diff vs nd splits)
 # share an exact color scale.
+# Divide every sample matrix by that track's own genomic background, turning
+# the plotted value into fold enrichment. Errors rather than silently passing
+# raw signal through if a factor is missing — a half-normalised panel set is
+# worse than an un-normalised one.
+apply_bg_norm <- function(mats, bg_factors) {
+  if (is.null(bg_factors)) {
+    stop("normalize = \"background\" needs bg_factors; ",
+         "run the 'Per-track background scale factors' chunk in 8g.")
+  }
+  missing <- setdiff(names(mats), names(bg_factors))
+  if (length(missing)) {
+    stop("No background factor for: ", paste(missing, collapse = ", "))
+  }
+  for (sn in names(mats)) mats[[sn]] <- mats[[sn]] / bg_factors[[sn]]
+  mats
+}
+
 compute_unified_col_fun <- function(tornado_data,
-                                    normalize = c("none", "sum_to_one"),
+                                    normalize = c("none", "sum_to_one", "background"),
                                     col_pal = c("white", "darkblue"),
-                                    cap_quantile = 0.99) {
+                                    cap_quantile = 0.99,
+                                    bg_factors = NULL) {
   normalize    <- match.arg(normalize)
   mats         <- tornado_data$mats
   group_factor <- tornado_data$group_factor
+
+  if (normalize == "background") mats <- apply_bg_norm(mats, bg_factors)
 
   if (normalize == "sum_to_one") {
     for (sn in names(mats)) {
@@ -2168,16 +1648,20 @@ compute_unified_col_fun <- function(tornado_data,
 # Render the list with draw_independent_heatmaps() below.
 build_tornado_heatmap_independent <- function(tornado_data,
                                               display_groups = NULL,
-                                              normalize = c("none", "sum_to_one"),
+                                              normalize = c("none", "sum_to_one", "background"),
                                               col_pal = c("white", "darkblue"),
                                               cap_quantile = 0.99,
                                               col_fun = NULL,
                                               use_raster = TRUE,
                                               group_colors = feature_group_colors,
+                                              bg_factors = NULL,
+                                              sample_groups = NULL,
                                               verbose = TRUE) {
   normalize    <- match.arg(normalize)
   mats         <- tornado_data$mats
   group_factor <- tornado_data$group_factor
+
+  if (normalize == "background") mats <- apply_bg_norm(mats, bg_factors)
 
   if (normalize == "sum_to_one") {
     for (sn in names(mats)) {
@@ -2204,7 +1688,10 @@ build_tornado_heatmap_independent <- function(tornado_data,
   } else {
     cap <- environment(col_fun)$breaks[length(environment(col_fun)$breaks)]
   }
-  legend_title <- if (normalize == "sum_to_one") "fraction" else "signal"
+  legend_title <- switch(normalize,
+    sum_to_one = "fraction",
+    background = "fold over\nbackground",
+    "signal")
 
   line_cols <- group_colors[levels(group_factor)]
   if (any(is.na(line_cols))) {
@@ -2235,11 +1722,24 @@ build_tornado_heatmap_independent <- function(tornado_data,
                  else
                    rep("", length(levels(group_factor)))
 
+    # Column title. With `sample_groups` the 33 per-sample panels are labelled
+    # by SAMPLE GROUP rather than by sample id: the name is drawn once, over
+    # the middle panel of each run of same-group samples, and blank elsewhere.
+    # `mats` must already be ordered by group for the runs to be contiguous —
+    # asserted where sample_groups is built.
+    col_title <- if (is.null(sample_groups)) {
+      sn
+    } else {
+      g   <- sample_groups[[sn]]
+      idx <- which(sample_groups[names(mats)] == g)
+      if (i == idx[ceiling(length(idx) / 2)]) g else ""
+    }
+
     EnrichedHeatmap::EnrichedHeatmap(
       mat_sorted,
       col          = col_fun,
       name         = sn,
-      column_title = sn,
+      column_title = col_title,
       row_split    = gf_sorted,
       row_title    = row_title,
       cluster_rows = FALSE,
@@ -2297,102 +1797,311 @@ draw_independent_heatmaps <- function(heatmaps,
 }
 ```
 
-## (1b) Group-averaged tornado heatmap (4 columns: WT, PH, TN, NR)
+## (1b) Group-averaged tornado heatmap (5 columns: WT, PH, TN, NRT, NR)
 
 ```{r}
 # Normalization: "sum_to_one" or "none"
-heatmap_norm <- "none"
+heatmap_norm <- "background"   # "none" | "sum_to_one" | "background"
 
-td_avg_rds <- file.path(plot_dir, "td_avg_1k_w20.rds")
-td_avg <- if (file.exists(td_avg_rds)) {
+td_avg_rds <- file.path(plot_dir, sprintf("td_avg_1k_w20_%s.rds", set_tag))
+# The cache is keyed only by filename, so a cache written before a track was
+# added to bigwigs_avg — or before a feature set was added to set_spec —
+# would silently come back short a column or a row block. Recompute unless
+# it holds exactly the tracks AND the feature groups we asked for, in order.
+cached_td_avg <- if (file.exists(td_avg_rds)) readRDS(td_avg_rds) else NULL
+if (!is.null(cached_td_avg) &&
+    !identical(names(cached_td_avg$mats), names(bigwigs_avg))) {
+  message("Cached td_avg has tracks [", paste(names(cached_td_avg$mats), collapse = ", "),
+          "] but bigwigs_avg is [", paste(names(bigwigs_avg), collapse = ", "),
+          "] - recomputing.")
+  cached_td_avg <- NULL
+}
+if (!is.null(cached_td_avg) &&
+    !identical(levels(cached_td_avg$group_factor), set_order)) {
+  message("Cached td_avg has groups [",
+          paste(levels(cached_td_avg$group_factor), collapse = ", "),
+          "] but set_order is [", paste(set_order, collapse = ", "),
+          "] - recomputing.")
+  cached_td_avg <- NULL
+}
+td_avg <- if (!is.null(cached_td_avg)) {
   message("Loading cached td_avg from ", td_avg_rds)
-  readRDS(td_avg_rds)
+  cached_td_avg
 } else {
-  message("Computing td_avg (4 bigwig imports + normalizeToMatrix)...")
+  message("Computing td_avg (", length(bigwigs_avg),
+          " bigwig imports + normalizeToMatrix)...")
   out <- compute_tornado_matrices(feats, bigwigs_avg, extend = 1000, w = 20)
   saveRDS(out, td_avg_rds)
   out
 }
 
 # Unified color scale across BOTH splits (diff and nd) of the avg heatmap.
-avg_col_fun <- compute_unified_col_fun(td_avg, normalize = heatmap_norm)
+avg_col_fun <- compute_unified_col_fun(td_avg, normalize = heatmap_norm,
+                                       bg_factors = bg_avg)
 
-# Split 1: differential (inc_r + dec_nr)
+# Panel membership comes from set_spec$split, so dropping an empty set in
+# 8g removes it from the right split automatically.
+splits_of <- function(which_split)
+  set_order[vapply(set_spec, `[[`, character(1), "split") == which_split]
+diff_groups <- splits_of("diff")   # inc_*, dec_* for every surviving label
+nd_groups   <- splits_of("nd")     # nd_*  for every surviving label
+
+# Row blocks per split are no longer fixed (Control is now its own set in the
+# Increase row), so the canvas has to grow with them or the blocks compress.
+# 2.5 in/block reproduces the historical 10 in at 4 blocks exactly, so old
+# figures are unchanged and only the larger grids get taller.
+split_height_in <- function(groups) max(10, 2.5 * length(groups))
+
+# Split 1: differential — one row block per (call x label) that cleared
+# min_set_size, so with a 3-label model this is up to 6, not the old 4.
 draw_independent_heatmaps(
   build_tornado_heatmap_independent(
-    td_avg, display_groups = c("inc_r", "dec_nr"),
-    normalize = heatmap_norm, col_fun = avg_col_fun
+    td_avg, display_groups = diff_groups,
+    normalize = heatmap_norm, col_fun = avg_col_fun, bg_factors = bg_avg
   ),
   svg_path = file.path(plot_dir,
-                       sprintf("tornado_heatmap_averages_diff_%s_1k_w20.svg",
-                                heatmap_norm)),
-  column_title = sprintf("Differential (inc_r, dec_nr) — group averages [%s]",
-                          heatmap_norm),
+                       sprintf("tornado_heatmap_averages_diff_%s_1k_w20_%s.svg",
+                                heatmap_norm, set_tag)),
+  column_title = sprintf("Differential (%s) — group averages [%s]",
+                          paste(diff_groups, collapse = ", "), heatmap_norm),
   panel_width_in = 2.5,
-  height_in      = 8
+  height_in      = split_height_in(diff_groups)
 )
 
-# Split 2: non-differential (nd_r + nd_nr)
+# Split 2: non-differential — one row block per surviving label
 draw_independent_heatmaps(
   build_tornado_heatmap_independent(
-    td_avg, display_groups = c("nd_r", "nd_nr"),
-    normalize = heatmap_norm, col_fun = avg_col_fun
+    td_avg, display_groups = nd_groups,
+    normalize = heatmap_norm, col_fun = avg_col_fun, bg_factors = bg_avg
   ),
   svg_path = file.path(plot_dir,
-                       sprintf("tornado_heatmap_averages_nd_%s_1k_w20.svg",
-                                heatmap_norm)),
-  column_title = sprintf("Non-differential (nd_r, nd_nr) — group averages [%s]",
-                          heatmap_norm),
+                       sprintf("tornado_heatmap_averages_nd_%s_1k_w20_%s.svg",
+                                heatmap_norm, set_tag)),
+  column_title = sprintf("Non-differential (%s) — group averages [%s]",
+                          paste(nd_groups, collapse = ", "), heatmap_norm),
   panel_width_in = 2.5,
-  height_in      = 8
+  height_in      = split_height_in(nd_groups)
 )
 ```
 
 ## (2b) Per-sample tornado heatmap (33 columns, grouped by WT/PH/TN/NR)
 
 ```{r}
-td_samples_rds <- file.path(plot_dir, "td_samples_1k_w20.rds")
-td_samples <- if (file.exists(td_samples_rds)) {
+td_samples_rds <- file.path(plot_dir,
+                            sprintf("td_samples_1k_w20_%s.rds", set_tag))
+cached_td_samples <- if (file.exists(td_samples_rds)) readRDS(td_samples_rds) else NULL
+# Same staleness guard as td_avg: a cache built with different tracks or a
+# different set_spec must not be reused.
+if (!is.null(cached_td_samples) &&
+    (!identical(names(cached_td_samples$mats), names(bigwigs_samples)) ||
+     !identical(levels(cached_td_samples$group_factor), set_order))) {
+  message("Cached td_samples does not match the current tracks/feature groups - recomputing.")
+  cached_td_samples <- NULL
+}
+td_samples <- if (!is.null(cached_td_samples)) {
   message("Loading cached td_samples from ", td_samples_rds)
-  readRDS(td_samples_rds)
+  cached_td_samples
 } else {
-  message("Computing td_samples (33 bigwig imports + normalizeToMatrix)...")
+  message(sprintf("Computing td_samples (%d bigwig imports x %d feature sets)...",
+                  length(bigwigs_samples), length(feats_for_samples)))
   out <- compute_tornado_matrices(feats_for_samples, bigwigs_samples,
                                    extend = 1000, w = 20)
   saveRDS(out, td_samples_rds)
   out
 }
 
-samples_col_fun <- compute_unified_col_fun(td_samples, normalize = heatmap_norm)
+samples_col_fun <- compute_unified_col_fun(td_samples, normalize = heatmap_norm,
+                                          bg_factors = bg_samples)
 
 draw_independent_heatmaps(
   build_tornado_heatmap_independent(
-    td_samples, display_groups = c("inc_r", "dec_nr"),
-    normalize = heatmap_norm, col_fun = samples_col_fun
+    td_samples, display_groups = diff_groups,
+    normalize = heatmap_norm, col_fun = samples_col_fun,
+    bg_factors = bg_samples, sample_groups = sample_groups
   ),
   svg_path = file.path(plot_dir,
-                       sprintf("tornado_heatmap_per_sample_diff_%s_1k_w20.svg",
-                                heatmap_norm)),
-  column_title = sprintf("Differential (inc_r, dec_nr) — per-sample [%s]",
-                          heatmap_norm),
+                       sprintf("tornado_heatmap_per_sample_diff_%s_1k_w20_%s.svg",
+                                heatmap_norm, set_tag)),
+  column_title = sprintf("Differential (%s) — per-sample [%s]",
+                          paste(diff_groups, collapse = ", "), heatmap_norm),
   panel_width_in = 0.7,
-  height_in      = 8
+  height_in      = split_height_in(diff_groups)
 )
 
 draw_independent_heatmaps(
   build_tornado_heatmap_independent(
-    td_samples, display_groups = c("nd_r", "nd_nr"),
-    normalize = heatmap_norm, col_fun = samples_col_fun
+    td_samples, display_groups = nd_groups,
+    normalize = heatmap_norm, col_fun = samples_col_fun,
+    bg_factors = bg_samples, sample_groups = sample_groups
   ),
   svg_path = file.path(plot_dir,
-                       sprintf("tornado_heatmap_per_sample_nd_%s_1k_w20.svg",
-                                heatmap_norm)),
-  column_title = sprintf("Non-differential (nd_r, nd_nr) — per-sample [%s]",
-                          heatmap_norm),
+                       sprintf("tornado_heatmap_per_sample_nd_%s_1k_w20_%s.svg",
+                                heatmap_norm, set_tag)),
+  column_title = sprintf("Non-differential (%s) — per-sample [%s]",
+                          paste(nd_groups, collapse = ", "), heatmap_norm),
   panel_width_in = 0.7,
-  height_in      = 8
+  height_in      = split_height_in(nd_groups)
 )
 ```
+# 8k. Cosine quartiles within a fixed DESeq2 category
+
+Every other figure in this document either selects on cosine (8g-8i) or
+lets the DESeq2 call vary with it (8f), so none of them can separate
+"the embedding recovers what DESeq2 already found" from "the embedding
+adds something DESeq2 missed".
+
+This one holds the DESeq2 category **fixed** and varies cosine inside it.
+Take all `inc` regions, split them into quartiles by cosine to the Renin
+label, and measure the renin-minus-non-renin signal in each. If Q4 > Q1
+the embedding is ordering regions the fold-change call did not, and that
+statement is immune to the circularity objection because every region
+plotted carries the same DESeq2 label.
+
+Two deliberate departures from 8g:
+
+* **No intersection with a StarSpace label.** `inc_r` is already a
+  cosine-based selection; using it would put cosine on both sides again.
+  The input here is the raw `inc` / `dec` key set from 8c.
+* **No top-N.** Quartiles are defined on the full category, so the cosine
+  range is not truncated.
+
+Signal comes from the same five group-average bigWigs as 8h, so the two
+figures are directly comparable. Note this is bigWig coverage, not the
+quantity DESeq2 modelled — for a number to quote in the text, recompute
+the delta from the normalised count matrix that fed `dds`
+(`1_featureCounts_quantilesNormalization.R`); the bigWigs are depth-
+normalised per sample and then averaged, which is a different
+normalisation.
+
+```{r}
+q_extend  <- 1000
+q_w       <- 20
+q_center  <- 200     # bp each side of the midpoint used for the scalar delta
+q_renin     <- c("WT", "PH", "TN")     # renin-expressing group averages
+q_non_renin <- c("NRT", "NR")          # non-renin group averages
+stopifnot(all(c(q_renin, q_non_renin) %in% names(bigwigs_avg)))
+
+# inc / dec as plain key vectors from 8c, turned back into GRanges.
+keys_to_gr <- function(keys) {
+  # Anchored at the END: 33 chromosomes in this universe contain underscores
+  # (chr1_GL456210_random and friends, 270 regions), so splitting on "_" gives
+  # a ragged list that do.call(rbind, .) silently recycles into wrong
+  # coordinates. Same regex as write_set_bed() in 8e.
+  m  <- stringr::str_match(keys, "^(.+)_([0-9]+)_([0-9]+)$")
+  ok <- !is.na(m[, 1])
+  if (any(!ok)) {
+    warning(sum(!ok), " key(s) did not parse as <chrom>_<start>_<end>; dropped.")
+  }
+  GenomicRanges::GRanges(
+    seqnames = m[ok, 2],
+    ranges   = IRanges::IRanges(as.integer(m[ok, 3]), as.integer(m[ok, 4])))
+}
+
+cos_renin_col <- cos_col(focus_label)
+cos_r_lookup  <- key_cos[[cos_renin_col]]
+
+# One feature set per (category, quartile).
+build_quartiles <- function(keys, tag, n_q = 4) {
+  cv   <- cos_r_lookup[keys]
+  keep <- is.finite(cv)
+  keys <- keys[keep]; cv <- cv[keep]
+  if (!length(keys)) return(list())
+  qs <- stats::quantile(cv, probs = seq(0, 1, length.out = n_q + 1), na.rm = TRUE)
+  qs[1] <- -Inf; qs[length(qs)] <- Inf
+  bin <- cut(cv, unique(qs), include.lowest = TRUE, labels = FALSE)
+  out <- lapply(seq_len(n_q), function(q) keys_to_gr(keys[which(bin == q)]))
+  names(out) <- sprintf("%s_Q%d", tag, seq_len(n_q))
+  out[lengths(out) > 0]
+}
+
+q_feats <- c(build_quartiles(inc, "inc"), build_quartiles(dec, "dec"))
+message("Cosine-quartile feature sets (ranked by ", cos_renin_col, "):\n",
+        paste(sprintf("  %-8s %7s regions", names(q_feats),
+                      format(lengths(q_feats), big.mark = ",")),
+              collapse = "\n"))
+
+q_rds <- file.path(plot_dir, "df_cos_quartiles_1k_w20.rds")
+if (file.exists(q_rds)) {
+  df_q <- readRDS(q_rds)
+  message("Loaded cached quartile profiles: ", q_rds)
+} else {
+  df_q <- flatten_features_eh(q_feats, bigwigs_avg,
+                              extend = q_extend, w = q_w)
+  saveRDS(df_q, q_rds)
+}
+
+df_q$category <- sub("_Q[0-9]+$", "", df_q$feature_set)
+df_q$quartile <- as.integer(sub("^.*_Q", "", df_q$feature_set))
+```
+
+## (1) Profiles by quartile
+
+```{r, fig.width = 11, fig.height = 6}
+p_q_prof <- ggplot(df_q,
+                   aes(position, mean,
+                       colour = factor(quartile),
+                       group  = interaction(quartile, sample_name))) +
+  geom_line(linewidth = 0.5) +
+  facet_grid(category ~ sample_name) +
+  scale_colour_viridis_d(name = sprintf("%s quartile\n(Q4 = closest)", focus_label),
+                         option = "C", end = 0.9) +
+  labs(x = "distance from region midpoint (bp)",
+       y = "mean bigWig coverage",
+       title = sprintf("Signal by %s cosine quartile, DESeq2 category held fixed",
+                       focus_label)) +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+
+ggsave(file.path(plot_dir, "starspace_cos_quartile_profiles.svg"),
+       p_q_prof, width = 11, height = 6)
+
+```
+
+## (2) Renin minus non-renin delta per quartile
+
+The scalar is the mean over the central +/-`q_center` bp. Averaging
+positions and then regions is the same number as averaging regions and
+then positions, so this is exact for the mean; the ribbon is a
+across-region SEM propagated from the per-position `sd` and `n` that
+`flatten_features_eh` returns, and it ignores the correlation between
+adjacent bins, so read it as indicative rather than as a test.
+
+```{r, fig.width = 7, fig.height = 4}
+q_core <- subset(df_q, abs(position) <= q_center)
+
+q_grp <- q_core %>%
+  mutate(arm = ifelse(sample_name %in% q_renin, "renin", "non_renin")) %>%
+  group_by(category, quartile, arm) %>%
+  summarise(sig = mean(mean),
+            sem = sqrt(sum((sd / sqrt(n))^2)) / n(),
+            .groups = "drop")
+
+q_delta <- q_grp %>%
+  tidyr::pivot_wider(names_from = arm, values_from = c(sig, sem)) %>%
+  mutate(delta = sig_renin - sig_non_renin,
+         delta_sem = sqrt(sem_renin^2 + sem_non_renin^2))
+
+p_q_delta <- ggplot(q_delta, aes(factor(quartile), delta,
+                                 group = category, colour = category)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_errorbar(aes(ymin = delta - delta_sem, ymax = delta + delta_sem),
+                width = 0.15) +
+  geom_line() + geom_point(size = 2.5) +
+  labs(x = sprintf("%s cosine quartile (Q4 = closest to label)", focus_label),
+       y = sprintf("mean coverage, renin (%s) - non-renin (%s)",
+                   paste(q_renin, collapse = "/"),
+                   paste(q_non_renin, collapse = "/")),
+       title = "Does embedding distance order regions within a fixed DESeq2 call?") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+
+ggsave(file.path(plot_dir, "starspace_cos_quartile_delta.svg"),
+       p_q_delta, width = 7, height = 4)
+
+
+knitr::kable(q_delta, digits = 4)
+```
+
 # 8j. GO enrichment weighted-rank plot — refined Renin vs Non-renin regions
 
 Same GREAT enrichment + renin-term weighted-rank procedure as
@@ -2421,9 +2130,12 @@ library(rGREAT)
 
 ## Build refined Renin / Non-renin GRanges from 8e intersection BEDs
 
-Reload from disk so this chunk is independent of whether the in-memory
-`inc_r` / `dec_nr` / etc. variables have been overwritten by the
-top-N or knee-based subsetting in 8g.
+Reload from disk so this chunk is independent of the in-memory `gr_list`
+/ `inc_r` / etc., which 8g has already narrowed by top-N and by the
+cosine ranking. 8j is still a two-sided Renin-vs-rest comparison and so
+keeps using the pooled `_nr` BEDs that 8e writes alongside the per-label
+ones; `inc_nr ∪ dec_nr ∪ nd_nr` is exactly the Control ∪ Tumoral union
+that 8g now handles as separate sets.
 
 ```{r}
 load_bed_8j <- function(path) {
@@ -2479,69 +2191,42 @@ names(ss_enrichment) <- names(ss_query)
 ## Weighted rank of renin-related GO terms
 
 ```{r}
-ss_filterEnrichment <- function(df) {
-  if (nrow(df) == 0) return(df)
-  # rGREAT 1.x column for foreground gene hits is `Hyper_Observed_Gene_Hits`,
-  # not `Hyper_Foreground_Gene_Hits`. If your rGREAT version differs, the
-  # message below shows the actual columns so you can swap names.
-  message("Enrichment columns: ", paste(colnames(df), collapse = ", "))
-  keep <- df$Hyper_Adjp_BH <= 0.1 & df$Hyper_Observed_Gene_Hits >= 3
-  go <- df[which(keep), , drop = FALSE]
-  rownames(go) <- seq_len(nrow(go))
-  go
-}
-
-ss_getReninGOTerms <- function(dfs) {
-  keywords <- c(
-    "notch", "cAMP",
-    "angiotensin", "aldosterone", "renin",
-    "vasculogenesis", "blood vessel",
-    "arteriole", "blood pressure",
-    "smooth muscle cell",
-    "cell fate",
-    "kidney", "renal", "nephron"
-  )
-  pattern <- paste(keywords, collapse = "|")
-  matched <- unlist(lapply(dfs, function(df) {
-    df$name[grepl(pattern, df$name, ignore.case = TRUE)]
-  }))
-  unique(matched)
-}
-
-ss_getRank <- function(df, group) {
-  df <- df[order(df$Hyper_Adjp_BH), ]
-  df$rank_pvalue <- seq_len(nrow(df))
-  df <- df[order(df$Hyper_Fold_Enrichment), ]
-  df$rank_fold <- seq_len(nrow(df))
-  df$Rank <- rowMeans(df[, c("rank_pvalue", "rank_fold")])
-  df$Group <- group
-  df
-}
-
-ss_getRankWeight <- function(dfs, my_go_terms) {
-  total <- max(sapply(dfs, nrow))
-  for (i in seq_along(dfs)) {
-    dfs[[i]]$rank_pvalue_weight <- (total - dfs[[i]]$rank_fold) / total
-    dfs[[i]] <- subset(dfs[[i]], name %in% my_go_terms)
-  }
-  for (t in my_go_terms) {
-    term_sum <- sum(sapply(dfs, function(df) {
-      w <- df$rank_pvalue_weight[df$name == t]
-      if (length(w) == 0) 0 else w
-    }))
-    for (i in seq_along(dfs)) {
-      idx <- dfs[[i]]$name == t
-      if (any(idx)) {
-        dfs[[i]]$rank_weight[idx] <- dfs[[i]]$rank_pvalue_weight[idx] / term_sum
-      }
-    }
-  }
-  dfs
-}
+# Shared with 4_greatGOenrichment.Rmd. 8j used to carry its own `ss_*` copies
+# that had drifted back to the pre-fix versions of all four functions -- see
+# the header of go_enrichment_functions.R for what each of them got wrong.
+source("go_enrichment_functions.R")
 ```
 
 ```{r}
-ss_go        <- lapply(ss_enrichment, ss_filterEnrichment)
+# Same order of operations as 4_greatGOenrichment.Rmd 4d/4e, which matters:
+#
+#   go_results_all  FULL tables + a `sig` flag  -> what getRank/getRankWeight see
+#   go_results      significance-filtered       -> ONLY used to choose terms
+#
+# 8j used to rank and weight the FILTERED tables. A term clearing the filter in
+# one region set but not the other then contributed 0 for the other set,
+# term_sum collapsed to one value, and rank_weight came out exactly 1.0 — a
+# spurious 100% bar that looked identical to a genuinely exclusive term.
+ss_all <- lapply(ss_enrichment, function(df) {
+  df$sig <- !is.na(df$Hyper_Adjp_BH) &
+            df$Hyper_Adjp_BH <= 0.1 &
+            df$Hyper_Foreground_Gene_Hits >= 3
+  df
+})
+
+# filterEnrichment() keys on Hyper_Foreground_Gene_Hits, the column
+# 4_greatGOenrichment.Rmd has actually run against. Fail with the real column
+# list rather than a bare object-not-found if the GREAT server ever renames it.
+need <- c("Hyper_Adjp_BH", "Hyper_Foreground_Gene_Hits", "Hyper_Fold_Enrichment",
+          "name", "ID")
+absent <- setdiff(need, names(ss_enrichment[[1]]))
+if (length(absent)) {
+  stop("GREAT table is missing: ", paste(absent, collapse = ", "),
+       "\n  Columns present: ", paste(names(ss_enrichment[[1]]), collapse = ", "),
+       "\n  (older rGREAT called the hits column Hyper_Observed_Gene_Hits)")
+}
+
+ss_go <- lapply(ss_all, filterEnrichment)
 
 # Guard: empty enrichment table after filtering usually means foreground ≈
 # background (collapsing hypergeometric p-values toward 1). Print sizes so
@@ -2556,21 +2241,28 @@ if (any(n_rows_per_set == 0)) {
        ". Check the foreground vs background sizes in ss_getBioEnrichment().")
 }
 
-ss_renin_terms <- ss_getReninGOTerms(ss_go)
+# Terms from the FILTERED tables (significant in at least one set), by GO graph
+# ancestry — not the old keyword regex.
+ss_renin_terms <- getReninGOTerms(ss_go)
+message(sprintf("Renin-related GO terms (GO-ancestry): %d", length(ss_renin_terms)))
 
-ss_rank_dfs <- lapply(names(ss_go), function(s) ss_getRank(ss_go[[s]], group = s))
-names(ss_rank_dfs) <- names(ss_go)
-ss_rank_dfs <- ss_getRankWeight(ss_rank_dfs, ss_renin_terms)
+# Rank and weight on the FULL tables.
+ss_rank_dfs <- lapply(names(ss_all), function(s) getRank(ss_all[[s]], group = s))
+names(ss_rank_dfs) <- names(ss_all)
+ss_rank_dfs <- getRankWeight(ss_rank_dfs, ss_renin_terms)
 
 ss_plot_df <- do.call(rbind, ss_rank_dfs)
 ss_plot_df <- ss_plot_df[!is.na(ss_plot_df$name), ]
 rownames(ss_plot_df) <- NULL
 
+# getRank() is fold-only by design — the two region sets differ greatly in
+# size, so their hypergeometric p-values are not comparable across groups.
+# The old rank_pvalue / rank_pvalue_weight columns no longer exist.
 ss_plot_df <- ss_plot_df %>%
-  select(name, Group,
-         Rank_weight      = rank_weight,
-         Pval_rank        = rank_pvalue,
-         Pval_rank_weight = rank_pvalue_weight)
+  select(name, Group, sig,
+         Rank_weight = rank_weight,
+         Rank_fold   = rank_fold,
+         Fold        = Hyper_Fold_Enrichment)
 
 ss_plot_df$Group <- factor(ss_plot_df$Group, levels = c("Renin", "Non_renin"))
 
@@ -2614,4 +2306,334 @@ ggsave(output_file, plot = p_ss_go,
        width = max(4, n_terms * 0.1), height = 7, units = "in")
 
 p_ss_go
+```
+
+# 8l. Top GO terms per StarSpace cluster
+
+One panel per StarSpace label cluster — `Renin`, `Control`, `Tumoral` —
+showing that cluster's top enriched GO Biological Process terms.
+
+This is a deliberately simpler question than 8j. 8j scores *renin-related*
+terms on the **refined** Renin set (`inc_r`, i.e. DESeq2 ∩ StarSpace) against
+everything else. 8l drops the DESeq2 axis entirely and asks what each cluster
+of the embedding is enriched for on its own terms, using the cluster
+membership from 8b (`ss_sets`) with no DESeq2 intersection.
+
+`go_top_n` selects between two foregrounds, and the chunk is written to
+produce either from the same code:
+
+* **`NULL` — the whole cluster.** Every region assigned to that label, all
+  68,503 / 212,698 / 141,287 of them. This is the honest description of what
+  the embedding partitioned the universe into.
+* **an integer — the N regions closest to that cluster's own label** by cosine
+  similarity to the label embedding (`cos_mat`, computed in 8f). Cluster
+  assignment is already nearest-label, so this keeps the same ranking and just
+  cuts it off at N: the cluster's core rather than its whole basin. A cluster
+  of 212,698 regions is half the universe and its enrichment is diluted by
+  everything sitting near the decision boundary; the top N is the sharper
+  question, at the cost of no longer describing the full cluster.
+
+The two are written to different files and neither overwrites the other, so
+they can be read side by side.
+
+**Background is the cluster universe** (all three clusters pooled = the
+consensus peak universe the model was trained on), not the genome-wide null
+8j is forced to use. The three clusters partition that universe, so no cluster
+is anywhere near 100% of it — `Renin` is 16%, `Tumoral` 33%, `Control` 50% —
+and the collapse-toward-p=1 problem that made 8j use the genome-wide null does
+not arise here. Using the universe matters: against a genome-wide null every
+ATAC peak set enriches for "sits near a gene", and all three panels would
+return near-identical developmental terms. Against the universe those cancel
+and what is left is what separates one cluster from the other two.
+
+**GREAT runs locally**, via `rGREAT::great()`, and not by choice: the online
+server `4_greatGOenrichment.Rmd` submits to with `submitGreatJob()` **no
+longer exists**. `great.stanford.edu` returns NXDOMAIN from public DNS
+(checked against 8.8.8.8 from a compute node, 2026-09-06), while
+`stanford.edu` and `bioconductor.org` resolve normally from the same node —
+so this is the hostname being gone, not a cluster firewall. 4c/4d in
+`4_greatGOenrichment.Rmd` cannot be re-run as written; its existing outputs
+predate the shutdown.
+
+Local mode applies the same `basalPlusExt` regulatory-domain rule (5 kb
+upstream / 1 kb downstream, extended to 1 Mb) against
+`TxDb.Mmusculus.UCSC.mm10.knownGene` TSSs, so the enrichment model is GREAT's,
+but the column names differ from the web server's (`fold_enrichment_hyper` /
+`p_adjust_hyper` here vs `Hyper_Fold_Enrichment` / `Hyper_Adjp_BH` there) and
+the GO annotation comes from the locally installed `org.Mm.eg.db` rather than
+whatever vintage the server held. Numbers are therefore close to, but not
+byte-identical with, what 4c produced.
+
+Ranking follows `4_greatGOenrichment.Rmd` 4c (`plotTopEnrichedGO`): keep terms
+with fold enrichment ≥ `go_fold_min` (2, as in 4c) and ≥ 3 foreground gene
+hits, then take the smallest BH-adjusted p-values.
+
+**That filter empties the table for the whole-cluster foreground, and the
+reason is structural.** `fold_enrichment_hyper` is
+`observed_gene_hits / (gene_set_size * n_gene_gr / n_gene_total)`. A
+foreground covering a large fraction of the background touches nearly every
+gene, so `observed_gene_hits` saturates at `gene_set_size` and the ratio is
+pinned near 1 no matter how real the biology is. Measured on the whole-cluster
+run (job 19384856): the **maximum** fold over ~9,280 terms was 1.24 for Renin
+(16% of the universe), 1.05 for Control (50%) and 1.08 for Tumoral (33%) — and
+for Control and Tumoral that maximum equals the third quartile, which is the
+saturation signature. Nothing anywhere near 2 exists to be kept.
+
+So this is not a threshold to lower; a "fold enrichment" axis spanning
+1.00–1.05 measures the foreground's size, not its biology. It is the reason
+`go_top_n` exists: at 5,000 regions each cluster is ~1.2% of the universe and
+the gene hits stop saturating. The p-values remain informative in both cases
+(2,018 / 986 / 489 terms at BH ≤ 0.05 on the whole clusters), which is why the
+failure shows up only in the fold channel. The hypergeometric (gene-based) columns are used, which
+are the `Hyper_*` columns 4c and 8j rank on; local `great()` calls them
+`fold_enrichment_hyper` / `p_adjust_hyper` and reports the binomial
+region-based test alongside them in the same table.
+
+## Cluster region sets and background
+
+```{r}
+# ss_sets comes from 8b and is keyed by the trained label; keys_to_gr() is the
+# underscore-safe key parser defined in 8k (33 chromosomes in this universe
+# have underscores in their names, so a plain strsplit gives wrong coordinates).
+cluster_go_labels <- intersect(cluster_labels, names(ss_sets))
+
+# NULL = whole cluster; an integer = that cluster's N regions closest to its
+# own label. The batch runners in src/cluster_go_run/ pass this through the
+# GO_TOP_N environment variable, so both variants come from this one chunk
+# rather than from a forked copy of it.
+go_top_n <- if (nzchar(Sys.getenv("GO_TOP_N"))) {
+  as.integer(Sys.getenv("GO_TOP_N"))
+} else {
+  NULL
+}
+go_tag <- if (is.null(go_top_n)) "" else sprintf("_top%d", go_top_n)
+
+# cos_mat (8f) is regions x labels. It carries label colnames but NO rownames
+# -- 8f keeps the region names beside it in emb$region_names and joins by
+# column -- so index it through an explicit name -> row lookup rather than by
+# character subscript, which silently fails with "subscript out of bounds".
+cos_row_of <- if (is.null(go_top_n)) NULL else {
+  stats::setNames(seq_along(emb$region_names), emb$region_names)
+}
+
+# Rank each cluster's members by cosine to THAT cluster's label, not to
+# focus_label, so every panel is cut the same way relative to its own centre.
+take_cluster_core <- function(keys, label, n) {
+  if (is.null(n)) return(keys)
+  stopifnot(label %in% colnames(cos_mat))
+  ri <- cos_row_of[keys]
+  if (anyNA(ri)) {
+    stop(sum(is.na(ri)), " region(s) of cluster ", label,
+         " are absent from model.tsv; cos_mat and ss_sets disagree.")
+  }
+  cv <- cos_mat[ri, label]
+  keys[order(cv, decreasing = TRUE)][seq_len(min(n, length(keys)))]
+}
+
+cluster_go_keys <- lapply(cluster_go_labels, function(lab)
+  take_cluster_core(ss_sets[[lab]], lab, go_top_n))
+names(cluster_go_keys) <- cluster_go_labels
+cluster_go_gr <- lapply(cluster_go_keys, keys_to_gr)
+
+# Union of all clusters = the consensus universe. Built from ss_sets, NOT from
+# cluster_go_keys: the background is the whole universe in both variants, so a
+# top-N foreground is tested against everything rather than against a
+# correspondingly shrunken background, and the two figures stay comparable.
+cluster_go_bg <- keys_to_gr(unlist(ss_sets[cluster_go_labels], use.names = FALSE))
+
+message(sprintf("8l foregrounds (%s): %s | background: %s regions",
+                if (is.null(go_top_n)) "whole cluster"
+                  else sprintf("top %d closest to own label", go_top_n),
+                paste(sprintf("%s=%s", names(cluster_go_gr),
+                              format(lengths(cluster_go_gr), big.mark = ",")),
+                      collapse = ", "),
+                format(length(cluster_go_bg), big.mark = ",")))
+
+# Same GO_enrichment/ directory the 4_greatGOenrichment.Rmd figures live in.
+go_plot_dir <- file.path(plot_dir, "GO_enrichment")
+dir.create(go_plot_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Run local GREAT, one table per cluster
+
+```{r}
+# exclude = NULL, not the "gap" default: resolving the default fetches the mm10
+# gap track from UCSC.
+#
+# Cost is NOT driven by the foreground size, which is the intuitive guess and
+# is wrong. Measured on this data with 8 cores: three whole clusters
+# (68,503 + 212,698 + 141,287 regions) took 23m47s, three top-5,000
+# foregrounds took 13m18s. A 40x smaller foreground bought 1.8x, because the
+# per-cluster fixed cost -- extending the TSS set, overlapping the
+# 422,488-region background, and scoring 14,957 gene sets -- is paid whatever
+# the foreground size. Shrinking go_top_n further is a sharper QUESTION, not a
+# faster run.
+#
+# Cached, so the figure can be re-cut without re-running any of that. Delete
+# the RDS to force a refresh after re-clustering.
+cluster_go_rds <- file.path(go_plot_dir,
+                            sprintf("cluster_go_bp_tables%s.rds", go_tag))
+
+# Parallel over gene sets. Under SLURM take the allocation; interactively stay
+# single-core rather than forking 40 workers on a shared login node.
+great_cores <- max(1L, as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "1")))
+
+if (file.exists(cluster_go_rds)) {
+  cluster_go_tabs <- readRDS(cluster_go_rds)
+  message("Loaded cached GREAT tables: ", cluster_go_rds)
+} else {
+  cluster_go_tabs <- lapply(names(cluster_go_gr), function(lab) {
+    message("GREAT (local) for cluster ", lab, " ...")
+    res <- rGREAT::great(cluster_go_gr[[lab]],
+                         gene_sets   = "GO:BP",
+                         tss_source  = "TxDb.Mmusculus.UCSC.mm10.knownGene",
+                         background  = cluster_go_bg,
+                         exclude     = NULL,
+                         min_gene_set_size = 5,
+                         cores       = great_cores)
+    rGREAT::getEnrichmentTable(res)
+  })
+  names(cluster_go_tabs) <- names(cluster_go_gr)
+  saveRDS(cluster_go_tabs, cluster_go_rds)
+}
+
+stopifnot(all(c("description", "fold_enrichment_hyper", "p_adjust_hyper",
+                "observed_gene_hits") %in% names(cluster_go_tabs[[1]])))
+```
+
+## Plot: p-value bars + fold-enrichment line, one panel per cluster
+
+```{r, fig.width = 3.74, fig.height = 1.77}
+go_n_terms    <- 5    # terms per panel; 3 x 5 bars is what fits in 95 mm
+go_fold_min   <- if (nzchar(Sys.getenv("GO_FOLD_MIN"))) {
+  as.numeric(Sys.getenv("GO_FOLD_MIN"))    # 4c's threshold; see the prose on
+} else {                                   # why relaxing it is usually wrong
+  2
+}
+go_name_chars <- 20   # x labels are vertical, so this is a HEIGHT budget
+
+# The vertical x labels are the binding constraint on a 45 mm figure, and the
+# numbers here are measured off rendered output, not estimated: at 6 pt one
+# character is ~1.2 mm tall, so 20 characters cost ~22 mm of the 45 and leave
+# the panel ~13 mm. 22 characters already squeezes the panel to ~10 mm, which
+# is not enough for a dual axis.
+#
+# Wrapping the labels onto two shorter lines was tried and is worse. It buys
+# back ~7 mm of height, but two 6 pt lines are ~4.2 mm wide against a ~5 mm bar
+# pitch, so neighbouring labels very nearly touch and it stops being obvious
+# which line belongs to which bar. One truncated line per bar reads cleanly.
+#
+# Truncation is lossy for GO BP names, so the full untruncated names are in the
+# table printed under this chunk -- read the figure with that table.
+
+# 4c's filter, on the local-GREAT column names.
+pick_top_go <- function(tb, lab, n = go_n_terms) {
+  keep <- subset(tb, is.finite(p_adjust_hyper) &
+                     fold_enrichment_hyper >= go_fold_min &
+                     observed_gene_hits >= 3)
+  if (!nrow(keep)) {
+    warning(sprintf(
+      "No GO term passes the 4c filter for cluster %s (fold >= %g, >= 3 gene hits). %s",
+      lab, go_fold_min,
+      sprintf("Max fold over %s terms was %.3f.",
+              format(nrow(tb), big.mark = ","),
+              max(tb$fold_enrichment_hyper, na.rm = TRUE))))
+    return(NULL)
+  }
+  keep <- head(keep[order(keep$p_adjust_hyper), , drop = FALSE], n)
+  # Foregrounds of 68k-213k regions drive adjusted p-values below double
+  # precision, and p == 0 would make -log10() infinite and blow up the y
+  # scale. Floor at the smallest representable double (-log10 = 307.65) and
+  # say so, rather than plotting Inf or silently dropping the strongest term.
+  floored <- keep$p_adjust_hyper < .Machine$double.xmin
+  if (any(floored)) {
+    message(sprintf("  %s: %d term(s) at p_adjust_hyper = 0, floored to %.3g",
+                    lab, sum(floored), .Machine$double.xmin))
+  }
+  data.frame(cluster = lab,
+             term    = keep$description,
+             negLogP = -log10(pmax(keep$p_adjust_hyper, .Machine$double.xmin)),
+             fold    = keep$fold_enrichment_hyper,
+             stringsAsFactors = FALSE)
+}
+
+go_df <- do.call(rbind, lapply(names(cluster_go_tabs), function(lab)
+  pick_top_go(cluster_go_tabs[[lab]], lab)))
+
+# Fail here, with the numbers, rather than let an empty frame reach order()
+# and surface as "order(integer(0), NULL, ...)" 40 minutes into a batch job.
+if (is.null(go_df) || !nrow(go_df)) {
+  stop("No GO term passes the filter in ANY cluster. Max fold_enrichment_hyper: ",
+       paste(sprintf("%s = %.3f", names(cluster_go_tabs),
+                     vapply(cluster_go_tabs,
+                            function(d) max(d$fold_enrichment_hyper, na.rm = TRUE),
+                            numeric(1))), collapse = ", "),
+       " against go_fold_min = ", go_fold_min,
+       ".\n  A whole-cluster foreground saturates the gene hits and pins the ",
+       "fold near 1 -- set go_top_n (GO_TOP_N) rather than lowering the ",
+       "threshold. See the prose above this chunk.")
+}
+
+go_df$cluster <- factor(go_df$cluster, levels = names(cluster_go_tabs))
+go_df <- go_df[order(go_df$cluster, go_df$negLogP, decreasing = c(FALSE, TRUE),
+                     method = "radix"), ]
+
+# One x level per ROW, not per term: a term enriched in two clusters would
+# otherwise share a level and be drawn in both panels by facet_wrap.
+go_df$x <- factor(seq_len(nrow(go_df)))
+go_labels <- ifelse(nchar(go_df$term) > go_name_chars,
+                    paste0(substr(go_df$term, 1, go_name_chars - 1), "\u2026"),
+                    go_df$term)
+names(go_labels) <- go_df$x
+
+# ggplot has ONE y scale, so the secondary axis needs a single global factor.
+# That is the better choice anyway: it keeps fold enrichment comparable across
+# the three panels instead of rescaling each one independently.
+go_scale <- max(go_df$negLogP) / max(go_df$fold)
+
+p_cluster_go <- ggplot(go_df, aes(x = x)) +
+  geom_col(aes(y = negLogP), fill = "grey75", colour = NA, width = 0.75) +
+  geom_line(aes(y = fold * go_scale, group = 1),
+            colour = "black", linewidth = 0.25) +
+  geom_point(aes(y = fold * go_scale), shape = 21, colour = "black",
+             fill = "white", size = 0.8, stroke = 0.3) +
+  facet_wrap(~ cluster, nrow = 1, scales = "free_x") +
+  scale_x_discrete(labels = go_labels) +
+  scale_y_continuous(
+    name     = expression(-log[10] * "(FDR)"),
+    expand   = expansion(mult = c(0, 0.08)),
+    # Two lines, not one: a 15-character axis title at 8 pt is ~23 mm tall
+    # against a ~13 mm panel, so "fold enrichment" on one line has its top
+    # clipped off by the device edge. Splitting it spends horizontal space,
+    # which this figure has.
+    sec.axis = sec_axis(~ . / go_scale, name = "fold\nenrichment")) +
+  theme_bw(base_size = 8) +
+  theme(
+    text             = element_text(size = 8, colour = "black"),
+    axis.text.x      = element_text(angle = 90, vjust = 0.5, hjust = 1,
+                                    size = 6, colour = "black"),
+    axis.text.y      = element_text(size = 6, colour = "black"),
+    axis.title.x     = element_blank(),
+    axis.title.y     = element_text(size = 8, colour = "black"),
+    axis.ticks       = element_line(linewidth = 0.25, colour = "black"),
+    axis.ticks.length = unit(0.6, "mm"),
+    strip.text       = element_text(size = 8, colour = "black",
+                                    margin = margin(0.3, 0.8, 0.3, 0.8, "mm")),
+    strip.background = element_rect(fill = NA, colour = "black",
+                                    linewidth = 0.25),
+    panel.grid       = element_blank(),
+    panel.border     = element_rect(colour = "black", linewidth = 0.25),
+    panel.spacing    = unit(1.5, "mm"),
+    plot.margin      = margin(1, 1, 1, 1, "mm"),
+    legend.position  = "none")
+
+# Named apart from 4c's top_enriched_go_*.svg, which are the DESeq2 sets.
+cluster_go_svg <- file.path(
+  go_plot_dir, sprintf("top_enriched_go_starspace_clusters%s.svg", go_tag))
+ggsave(cluster_go_svg, p_cluster_go, width = 95, height = 45, units = "mm")
+message("Saved: ", cluster_go_svg)
+
+knitr::kable(go_df[, c("cluster", "term", "negLogP", "fold")], digits = 3)
+
+p_cluster_go
 ```
